@@ -24,6 +24,24 @@ Every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays):
 - **Egress Rotation in Sweep:** In `--sweep` mode, every relay answering HTTP 429 is treated as having a throttled egress address and rotated until clean (`SWEEP_QUOTA_GUARD=0` by default so pool-wide 429 waves never halt rotation). In incremental `--once` mode, `GLOBAL_QUOTA_GUARD` still prevents rotation if a model is throttled pool-wide.
 - Concurrency: `ROTATE_CONCURRENCY` (default `1`) serialises restarts; `ROTATE_SPACING_MS` adds a mandatory gap between each.
 
+### Healthcheck remediation lane
+
+A relay whose WireGuard handshake never completes answers nothing at all, so
+its probe result is not a 429 and the rotation logic above leaves it alone —
+which is how a pool could sit with half its relays `(not ready)` indefinitely.
+
+Before probing, each sweep therefore inspects Docker health for every relay and
+restarts any container the healthcheck has marked `unhealthy`, using the same
+tier-1 soft restart as rotation. Remediation is capped at one restart per relay
+per `RELAY_COOLDOWN_S` and stamped in the state file as `lastUnhealthyRestart`,
+so a genuinely broken container cannot restart-loop the host. Restarted relays
+are flagged `pendingVerify` and re-probed after `EGRESS_SETTLE_S`, exactly like
+a rotation.
+
+Inspect it with `node keep-cold.mjs --status` (`lastUnhealthyRestart` is not
+printed, but rotation timestamps are) or `journalctl -u warp-keep-cold` for the
+`container healthcheck unhealthy — restarting` lines.
+
 ```bash
 node keep-cold.mjs --sweep             # full sweep (what the timer runs)
 node keep-cold.mjs --once             # incremental pass: suspects + audit sample only

@@ -702,6 +702,9 @@ function relayEntry(state, index) {
   dirty: e.dirty === true,
   pendingVerify: e.pendingVerify === true,
   last429: { model: typeof last429.model === "string" ? last429.model : "", ts: num(last429.ts) },
+  // Container-level healthcheck remediation stamp (separate lane from the
+  // 429 rotation budget: a dead handshake is not an egress throttle).
+  lastUnhealthyRestart: num(e.lastUnhealthyRestart),
   rotations: Array.isArray(e.rotations) ? e.rotations.map(num).filter((t) => t > 0) : [],
  };
 }
@@ -1243,10 +1246,63 @@ async function resetRelayUntilClean(index, models, state) {
  *
  * Returns true when at least SAFE_FLOOR relays are clean.
  */
+/** Container-level healthcheck status, or "none" when no healthcheck exists. */
+async function containerHealth(index) {
+ try {
+  const out = await docker(
+   ["inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", containerName(index)],
+   20_000,
+  );
+  return out.trim() || "none";
+ } catch {
+  return "missing";
+ }
+}
+
+/**
+ * Healthcheck remediation lane. A container docker flags as `unhealthy` is
+ * either handshake-less or has a dead route — neither is an upstream 429, so
+ * the rotation budget below never touches it (`not an egress rate limit, no
+ * reset`), which is how half a pool could sit "not ready" indefinitely.
+ * Restart it, honouring RELAY_COOLDOWN_S per relay so a permanently broken
+ * container cannot restart-loop the host.
+ */
+async function restartUnhealthyRelays(state) {
+ const restarted = [];
+ for (let index = 1; index <= COUNT; index++) {
+  const health = await containerHealth(index);
+  if (health !== "unhealthy") continue;
+  const last = relayEntry(state, index).lastUnhealthyRestart;
+  const waitLeftMs = last ? last + RELAY_COOLDOWN_S * 1000 - now() : 0;
+  if (waitLeftMs > 0) {
+   log(`#${index} unhealthy — last remediation restart ${Math.round((now() - last) / 1000)}s ago, waiting ${Math.ceil(waitLeftMs / 1000)}s`);
+   continue;
+  }
+  log(`#${index} container healthcheck unhealthy — restarting (WireGuard handshake remediation)`);
+  try {
+   await rotateContainer(index, 1, "health");
+   patchRelay(state, index, {
+    lastUnhealthyRestart: now(),
+    pendingVerify: true,
+    probeAfter: now() + EGRESS_SETTLE_S * 1000,
+   });
+   restarted.push(index);
+  } catch (err) {
+   log(`#${index} health remediation restart failed: ${shortReason(err)}`);
+  }
+ }
+ return restarted;
+}
+
 async function sweep() {
  const state = loadState();
  const models = PROBE_MODELS;
  log(`full sweep: ${COUNT} relay(s) x ${models.length} model(s) via ${RELAY_HOST}:${BASE_PORT + 1}..${BASE_PORT + COUNT}`);
+
+ const restartedUnhealthy = await restartUnhealthyRelays(state);
+ if (restartedUnhealthy.length) {
+  log(`restarted ${restartedUnhealthy.length} unhealthy relay(s): ${restartedUnhealthy.map((i) => `#${i}`).join(" ")}`);
+ }
 
  const results = new Map();
  await runPool(
