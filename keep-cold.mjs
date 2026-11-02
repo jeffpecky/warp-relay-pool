@@ -313,6 +313,16 @@ if (!["legacy", "minimal", "env-only", "timestamp-only"].includes(PROBE_FINGERPR
   console.error(`keep-cold: PROBE_FINGERPRINT='${process.env.PROBE_FINGERPRINT}' must be legacy|minimal|env-only|timestamp-only`);
   process.exit(2);
 }
+/** Probe transport: how the probe reaches the upstream TLS view.
+ *  auto (default) .. wreq-js Bun-fingerprint session through the lane when the
+ *                    target is opencode.ai, else legacy
+ *  legacy .......... relay-terminated HTTP (lane listener, Node TLS upstream)
+ *  wreq ............ force wreq (fail loud to legacy unusable-check) */
+const PROBE_TRANSPORT = (process.env.PROBE_TRANSPORT ?? "auto").trim().toLowerCase();
+if (!["auto", "legacy", "wreq"].includes(PROBE_TRANSPORT)) {
+  console.error(`keep-cold: PROBE_TRANSPORT='${process.env.PROBE_TRANSPORT}' must be auto|legacy|wreq`);
+  process.exit(2);
+}
 /** Pinned client version for the probe UA: the ecosystem's current pinned
  * fallback (live npm lookup is a proxy-side concern; the prober stays
  * deterministic). Declared up here because model discovery runs at module
@@ -873,12 +883,128 @@ async function readEnvelopeHead(res) {
 }
 
 // ── Probing ─────────────────────────────────────────────────────────
+// Bun TLS profile, copied verbatim from 9router's
+// open-sse/services/opencodeTlsClient.js (Bun 1.3.14 measured via tls.peet.ws,
+// 2026-10-27): ALPN HTTP1 only, X25519:P-256:P-384 groups, OCSP+ SCT on. The
+// point of the wreq probe is to measure the gate from the SAME fingerprint
+// class as real client traffic - a probe that rides the relay's Node TLS can
+// disagree with what a wreq client sees from the same egress. Only the
+// transport differs; the classification stays legacy.
+const WREQ_CIPHER_LIST = [
+  "TLS_AES_128_GCM_SHA256",
+  "TLS_AES_256_GCM_SHA384",
+  "TLS_CHACHA20_POLY1305_SHA256",
+  "ECDHE-ECDSA-AES128-GCM-SHA256",
+  "ECDHE-RSA-AES128-GCM-SHA256",
+  "ECDHE-ECDSA-AES256-GCM-SHA384",
+  "ECDHE-RSA-AES256-GCM-SHA384",
+  "ECDHE-ECDSA-CHACHA20-POLY1305",
+  "ECDHE-RSA-CHACHA20-POLY1305",
+  "ECDHE-ECDSA-AES128-SHA",
+  "ECDHE-RSA-AES128-SHA",
+  "ECDHE-ECDSA-AES256-SHA",
+  "ECDHE-RSA-AES256-SHA",
+  "AES128-GCM-SHA256",
+  "AES128-SHA",
+  "AES256-SHA",
+].join(":");
+const WREQ_TLS_PROFILE = {
+  cipherList: WREQ_CIPHER_LIST,
+  alpnProtocols: ["HTTP1"],
+  curvesList: "X25519:P-256:P-384",
+  enableOcspStapling: true,
+  enableSignedCertTimestamps: true,
+};
+
+// One wreq session per lane. Egress /64 belongs to the lane, and wreq's proxy
+// is session-scoped, so this mirrors 9router's one-session-per-proxy-URL rule.
+const wreqSessions = new Map();
+
+async function wreqAvailable() {
+  // Test hook: deterministic unavailability regardless of what the host
+  // happens to have installed globally (fake-relay scenarios must not ride).
+  if (process.env.KEEP_COLD_PROBE_WREQ_FAILFAST === "1") {
+    log("probe transport: wreq unavailable (test failfast) - legacy fallback");
+    return null;
+  }
+  try {
+    const wreq = await import("wreq-js");
+    if (typeof wreq?.createSession !== "function") throw new Error("missing createSession");
+    return wreq;
+  } catch (e) {
+    log(`probe transport: wreq unavailable (${String(e?.message ?? e).slice(0, 120)}) - legacy fallback`);
+    return null;
+  }
+}
+
+async function wreqSession(index, wreq) {
+  let entry = wreqSessions.get(index);
+  if (entry) return entry;
+  // Direct lane ingress speaks the same Basic Proxy-Authorization as the
+  // relay-wide router; empty RELAY_PROXY_AUTH means a mesh install without
+  // credentials (the probe then rides the unauthenticated lane shape).
+  const authority = RELAY_PROXY_AUTH ? `${RELAY_PROXY_AUTH}@` : "";
+  const proxy = `http://${authority}${RELAY_HOST}:${BASE_PORT + index}`;
+  entry = wreq.createSession({
+    emulation: { tlsOptions: { ...WREQ_TLS_PROFILE, alpnProtocols: [...WREQ_TLS_PROFILE.alpnProtocols] } },
+    proxy,
+  });
+  wreqSessions.set(index, entry);
+  return entry;
+}
+
+function closeWreqSession(index) {
+  const entry = wreqSessions.get(index);
+  if (!entry) return;
+  wreqSessions.delete(index);
+  Promise.resolve(entry).then((s) => s?.close?.()).catch(() => {});
+}
+
+/** Transport choice for the opencode gate: measurable truth about the egress
+ * comes from speaking its ClientHello, so prefer wreq when the module exists;
+ * anything else (non-opencode targets, forced legacy) stays relay-terminated.
+ * The wreq-unavailable fallback is logged once per process (wreqAvailable). */
+async function pickProbeTransport() {
+  if (PROBE_TRANSPORT === "legacy" || !PROBE_TARGET.includes("opencode.ai")) return "legacy";
+  const wreq = await wreqAvailable();
+  if (!wreq) return "legacy";
+  return { wreq };
+}
+
 async function probe(index, model) {
-  const url = `http://${RELAY_HOST}:${BASE_PORT + index}`;
   const { relayPath, body } = buildProbe(model);
   const sid = sessionId();
   const fp = fpDescriptor(sid);
   const t0 = Date.now();
+
+  // wreq transport: direct client-side TLS through lane N's egress. The
+  // relay-internal headers (x-relay-target/path, x-keep-cold-probe) are
+  // relay app internals a tunneled request must not carry — a real client
+  // never sends them.
+  const transport = await pickProbeTransport();
+  if (typeof transport === "object" && transport?.wreq) {
+    try {
+      const session = await wreqSession(index, transport.wreq);
+      const target = new URL(relayPath, PROBE_TARGET);
+      const headers = probeHeaders(relayPath, sid);
+      delete headers["x-relay-target"];
+      delete headers["x-relay-path"];
+      delete headers["x-keep-cold-probe"];
+      const res = await session.fetch(target, {
+        method: "POST",
+        headers,
+        body,
+        signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      });
+      return probeResponse(index, model, res, t0, fp, { transport: "wreq" });
+    } catch (e) {
+      // One dead probe must not poison the lane verdict with transport errors
+      // forever: report status 0 (same shape as a legacy transport failure).
+      return { index, model, status: 0, serverError: false, detail: `wreq: ${String(e?.message ?? e).slice(0, 150)}`, ms: Date.now() - t0, fp };
+    }
+  }
+
+  const url = `http://${RELAY_HOST}:${BASE_PORT + index}`;
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -891,32 +1017,41 @@ async function probe(index, model) {
       body,
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
-    if (res.status === 200) {
-      // A body that dies mid-read is a wedged egress, not a clean probe: the
-      // old `.catch(() => "")` silently turned it into a 200.
-      let head;
-      try {
-        head = await readEnvelopeHead(res);
-      } catch (e) {
-        return { index, model, status: 0, serverError: false, detail: `body read failed: ${String(e?.message ?? e)}`.slice(0, 160), ms: Date.now() - t0, fp };
-      }
-      const ms = Date.now() - t0;
-      if (SERVER_ERROR_RE.test(head)) {
-        const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
-        return { index, model, status: 200, serverError: true, detail: `envelope SSE ${evt}: ${head.replace(/\s+/g, " ").slice(0, 120)}`, ms, fp };
-      }
-      return { index, model, status: 200, serverError: false, detail: "", ms, fp };
-    }
-    const text = await res.text().catch(() => "");
-    const detail = text.replace(/\s+/g, " ").slice(0, 160);
-    // Numeric Retry-After only; an HTTP-date header is left to the gate.
-    const raRaw = res.status === 429 ? res.headers.get("retry-after") : null;
-    const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
-    return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, retryAfter, ms: Date.now() - t0, fp };
+    return probeResponse(index, model, res, t0, fp, { transport: "legacy" });
   } catch (e) {
     return { index, model, status: 0, serverError: false, detail: String(e?.message ?? e).slice(0, 160), ms: Date.now() - t0, fp };
   }
 }
+
+/** Shared verdict parsing for both transports: 200-envelope head, server_error
+ * shape, numeric retry-after. `probeResponse` mutates nothing else - the
+ * return shape is what classifyRelay() and the speed ranking already parse. */
+async function probeResponse(index, model, res, t0, fp, { transport }) {
+  if (res.status === 200) {
+    // A body that dies mid-read is a wedged egress, not a clean probe: the
+    // old `.catch(() => "")` silently turned it into a 200.
+    let head;
+    try {
+      head = await readEnvelopeHead(res);
+    } catch (e) {
+      return { index, model, status: 0, serverError: false, detail: `body read failed: ${String(e?.message ?? e)}`.slice(0, 160), ms: Date.now() - t0, fp };
+    }
+    const ms = Date.now() - t0;
+    if (SERVER_ERROR_RE.test(head)) {
+      const evt = /response\.failed/i.test(head) ? "response.failed" : /failed to generate/i.test(head) ? "failed to generate" : "server_error";
+      return { index, model, status: 200, serverError: true, detail: `envelope SSE ${evt}: ${head.replace(/\s+/g, " ").slice(0, 120)}`, ms, fp };
+    }
+    return { index, model, status: 200, serverError: false, detail: "", ms, fp };
+  }
+  const text = await res.text().catch(() => "");
+  const detail = text.replace(/\s+/g, " ").slice(0, 160);
+  // Numeric Retry-After only; an HTTP-date header is left to the gate.
+  const raRaw = res.status === 429 ? res.headers?.get?.("retry-after") : null;
+  const retryAfter = raRaw && /^\d+$/.test(raRaw.trim()) ? Number(raRaw.trim()) : null;
+  return { index, model, status: res.status, serverError: isServerError(res.status, detail), detail, retryAfter, ms: Date.now() - t0, fp };
+}
+
+/** Probe a set of models on one relay (serial - one relay, one egress). */
 
 /** Probe a set of models on one relay (serial — one relay, one egress). */
 async function probeRelay(index, models = PROBE_MODELS) {
@@ -1624,6 +1759,9 @@ function gate(entry, at) {
  */
 async function runRotation(job, state, dirty) {
  const container = containerName(job.index);
+ // The lane's egress /64 changes under this restart: the pooled wreq session
+ // would probe a dead egress. Drop it before any verification probe.
+ closeWreqSession(job.index);
  const at = await enqueueRestart(async () => {
   const started = now();
   if (job.tier2) {

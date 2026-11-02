@@ -172,6 +172,9 @@ function baseEnv(sc) {
   DOCKER_BIN: process.execPath,
   DOCKER_PREFIX_ARGS: sc.fakeDocker,
   FAKE_DOCKER_LOG: sc.dockerLog,
+  // Harness relays speak relay-terminated HTTP only (no CONNECT); the real
+  // wreq transport is exercised on the VPS (plan Task 2 Step 5 manual check).
+  PROBE_TRANSPORT: "legacy",
  };
 }
 
@@ -1236,4 +1239,31 @@ test("--sweep escalates to tier-2 when soft restart cannot move the /64", async 
  const lines = dockerLines(sc);
  assert.ok(lines.some((l) => l.includes("rm -f /etc/wireguard/wg0.conf")), "escalated to tier-2");
  assert.match(r.stdout, /escalating to a full reset/);
+});
+
+test("PROBE_TRANSPORT=legacy probes the relay-terminated lane as before", async () => {
+  const sc = newScenario({ count: 1 });
+  await startRelays(sc);
+  const logPath = path.join(sc.dir, "relay-1.log");
+  const r = await runOnce(sc, { TARGET_MODEL: "model-a", PROBE_TRANSPORT: "legacy" }, ["--probe"]);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const req = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.equal(req.relayTarget, "https://opencode.ai", "legacy mode rides the lane HTTP listener");
+  assert.equal(req.keepCold, "1");
+  assert.doesNotMatch(r.stdout, /probe transport/);
+});
+
+test("PROBE_TRANSPORT=wreq on a wreq-less host falls back to legacy with an explicit log line", async () => {
+  const sc = newScenario({ count: 1 });
+  await startRelays(sc);
+  const logPath = path.join(sc.dir, "relay-1.log");
+  const r = await runOnce(
+    sc,
+    { TARGET_MODEL: "model-a", PROBE_TRANSPORT: "wreq", KEEP_COLD_PROBE_WREQ_FAILFAST: "1" },
+    ["--probe"],
+  );
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /probe transport: wreq unavailable .* - legacy fallback/, "fallback is loud, not silent");
+  const req = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.equal(req.relayTarget, "https://opencode.ai", "fallback executes the legacy probe");
 });
