@@ -476,6 +476,9 @@ else
     else
       printf '\nRELAY_PROXY_AUTH=%s\n' "$RELAY_PROXY_AUTH" >> .env
     fi
+    # Credentials live in a world-readable file by default (umask 022); a
+    # public ingress password should be owner-only.
+    chmod 600 .env 2>/dev/null || true
     if [ -f .env ] && grep -q '^RELAY_DIRECT_PUBLIC=' .env; then
       sed -i.bak "s|^RELAY_DIRECT_PUBLIC=.*|RELAY_DIRECT_PUBLIC=1|" .env && rm -f .env.bak
     else
