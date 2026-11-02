@@ -83,6 +83,29 @@ print_next_steps() {
 }
 ADD_PRINTED=0
 
+# Startup grace: `compose up` returns before WireGuard handshakes complete, so
+# a status run right after a (re)start would print a wall of "(not ready)".
+# Poll container health first, bounded (GET_STATUS_WAIT_S, default 60s, 0
+# disables) so a genuinely dead relay still prints instead of hanging.
+WAIT_S="${GET_STATUS_WAIT_S:-60}"
+case "$WAIT_S" in ''|*[!0-9]*) WAIT_S=60 ;; esac
+if [ "$WAIT_S" -gt 0 ] && command -v docker >/dev/null 2>&1; then
+  waited=0
+  while [ "$waited" -lt "$WAIT_S" ]; do
+    pending=0
+    j=1
+    while [ "$j" -le "$COUNT" ]; do
+      state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "warp-relay-warp-${j}" 2>/dev/null || echo missing)"
+      case "$state" in healthy|none) ;; *) pending=$((pending + 1)) ;; esac
+      j=$((j + 1))
+    done
+    [ "$pending" -eq 0 ] && break
+    sleep 5
+    waited=$((waited + 5))
+  done
+  [ "$pending" -ne 0 ] && echo "note: ${pending} relay(s) still starting after ${waited}s (they recover on their own; mux skips them meanwhile)." && echo ""
+fi
+
 echo "=== WARP relay status (1..${COUNT}) ==="
 printf "%-10s %-8s %-34s %s\n" "INSTANCE" "PORT" "EGRESS IP" "TUNNEL URL"
 echo "--------------------------------------------------------------------------------------------"

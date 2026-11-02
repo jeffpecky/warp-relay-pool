@@ -508,8 +508,16 @@ if command -v systemctl >/dev/null 2>&1 && { [ "$(id -u)" -eq 0 ] || command -v 
   fi
 fi
 
-log_info "Building minimal MicroWARP image (warp-lite:latest, ~1.8 MiB RAM/node)..."
-docker build -t warp-lite:latest ./warp-lite
+# Build once. Rebuilding a byte-identical Dockerfile still produces a new
+# image digest, and `compose up` then recreates every warp container — which
+# means 10 fresh Cloudflare registrations and 10 pending handshakes on each
+# wizard re-run. Set WARP_REBUILD=1 to force a rebuild.
+if [ "${WARP_REBUILD:-0}" = "1" ] || ! docker image inspect warp-lite:latest >/dev/null 2>&1; then
+  log_info "Building minimal MicroWARP image (warp-lite:latest, ~1.8 MiB RAM/node)..."
+  docker build -t warp-lite:latest ./warp-lite
+else
+  log_info "Reusing existing warp-lite:latest image (WARP_REBUILD=1 to rebuild)."
+fi
 
 log_info "Generating docker-compose.yml for ${COUNT} relays..."
 # shellcheck disable=SC2086
@@ -526,7 +534,11 @@ sh ./generate-compose.sh "$COUNT" $WITH_TUNNELS_FLAG
 install -d -m 0777 .keep-cold
 
 log_info "Starting containers with Docker Compose..."
-$DOCKER_COMPOSE up -d --build --remove-orphans
+# Build only the relay app (its sources change with the checkout); the warp
+# services reuse the cached warp-lite image so their containers — and their
+# established WireGuard handshakes — survive a wizard re-run.
+$DOCKER_COMPOSE up -d --build relay
+$DOCKER_COMPOSE up -d --remove-orphans
 
 # -------------------------------------------------------------
 # 5. Wait for Readiness and Public URLs
@@ -556,7 +568,28 @@ if [ -n "$WITH_TUNNELS_FLAG" ]; then
   fi
 else
   log_info "Waiting for WARP WireGuard handshakes..."
-  sleep 15
+  # `compose up` returns as soon as the containers exist; the tunnel needs a
+  # handshake after that. Poll container health instead of a fixed sleep so
+  # the status table below reflects reality, capped so a dead relay still
+  # prints rather than hanging the wizard.
+  handshake_wait=0
+  while [ "$handshake_wait" -lt 120 ]; do
+    unhealthy=0
+    i=1
+    while [ "$i" -le "$COUNT" ]; do
+      state="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "warp-relay-warp-${i}" 2>/dev/null || echo missing)"
+      case "$state" in healthy|none) ;; *) unhealthy=$((unhealthy + 1)) ;; esac
+      i=$((i + 1))
+    done
+    [ "$unhealthy" -eq 0 ] && break
+    sleep 5
+    handshake_wait=$((handshake_wait + 5))
+  done
+  if [ "$unhealthy" -ne 0 ]; then
+    log_warn "${unhealthy} relay(s) still unhealthy after ${handshake_wait}s — keep-cold will retry them."
+  else
+    log_ok "All ${COUNT} WARP tunnels handshaked."
+  fi
 fi
 
 # -------------------------------------------------------------
