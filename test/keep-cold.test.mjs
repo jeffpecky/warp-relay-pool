@@ -917,7 +917,24 @@ test("invalid PROBE_FINGERPRINT fails fast instead of probing", async () => {
   assert.match(r.stderr, /PROBE_FINGERPRINT/);
 });
 
-test("legacy probe body carries exactly one env pair with Working directory", async () => {
+test("legacy probe system content opens with the CLI opener line and carries a non-install env dir", async () => {
+  const sc = newScenario({ count: 1 });
+  await startRelays(sc);
+  const logPath = path.join(sc.dir, "relay-1.log");
+  const r = await runOnce(sc, { TARGET_MODEL: "model-a" }, ["--probe"]);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  const req = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
+  assert.ok(
+    req.sys.startsWith("You are an AI agent running in OpenCode, a coding agent harness."),
+    `system must open with the CLI opener line, got: ${req.sys.slice(0, 80)}`,
+  );
+  const idxEnv = req.sys.indexOf("<env>");
+  assert.ok(idxEnv > 0, "<env> box must be appended after the opener, not before");
+  assert.match(req.sys, /Working directory: \/tmp\/keep-cold-probe/, "non-install workspace dir");
+  assert.equal(req.sys.trim(), req.sys, "no stray leading/trailing bytes");
+});
+
+test("invalid PROBE_FINGERPRINT fails fast instead of probing", async () => {
   const sc = newScenario({ count: 1 });
   await startRelays(sc);
   const logPath = path.join(sc.dir, "relay-1.log");
