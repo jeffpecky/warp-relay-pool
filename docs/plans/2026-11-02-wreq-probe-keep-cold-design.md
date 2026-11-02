@@ -28,11 +28,12 @@ design fixes the instrument and the cadence.
      (mirror `open-sse/utils/opencodeFingerprint.js` semantics; verify `buildProbe` output).
    - One wreq session per lane, created per probe run (sessions are cheap; no sharing state to
      decay), closed after the pass to free file handles.
-4. **Cadence 2 min, probe set event-driven**: `warp-keep-cold.timer` → `OnCalendar=*:0/2`.
-   Default pass = consume `.keep-cold/signals.json`, probe only signal-hot relay lanes plus
-   verification re-probes of lanes just rotated (`PROBE_AUDIT_SAMPLE=0` default). Probe volume
-   scales with actual guilt, so the 2-min clock costs nearly nothing steady-state.
-   Full sweep over all lanes × models remains opt-in (`node keep-cold.mjs --sweep`).
+4. **Cadence: signal-driven watch + backstop** — supersede the timer-only cadence: keep-cold runs
+   as a long-lived `--watch` service (fstat poll on `.keep-cold/signals.json`, ≈2 s latency),
+   with a backstop sweep tick every 15 min (`WATCH_SWEEP_MIN`, `PROBE_AUDIT_SAMPLE=0` default).
+   Probe volume scales with actual guilt — steady-state cost ≈ 0. Full sweep remains opt-in
+   (`node keep-cold.mjs --sweep`). Canonical plan: `docs/plans/2026-11-02-warppool-signals-plan.md`
+   (commit `c02ec76`); this doc is the decision record.
 5. **Fallback**: `wreq-js` missing or import fails → legacy relay-terminated probe, explicitly
    logged (`probe mode: legacy fallback`), classification untouched. Nobody is stranded by the
    native dep; `setup.sh` best-effort installs `wreq-js` alongside the Node install and warns on
@@ -51,7 +52,7 @@ design fixes the instrument and the cadence.
 CC/CLI turn → 9router TLS(Bun) → lane egress
 429 seen → 9router: rotate session + TLS, cooldown lane, POST /signal
 mux: cooldown makes the next connection hop lanes (quota relief ~seconds)
-keep-cold (2 min): consume signal → wreq-js true-fingerprint probe of that lane
+keep-cold (--watch): fs-watch on signals.json → consume → wreq-js true-fingerprint probe
   → still 429 → guarded ladder: restart container → fresh /64 → verify probe
 ```
 
