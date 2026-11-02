@@ -602,6 +602,7 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
         -e "s|^Environment=KEEP_COLD_LOG=.*|Environment=KEEP_COLD_LOG=${CURRENT_DIR}/keep-cold.log|" \
         -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
         -e "s|^Environment=BASE_PORT=.*|Environment=BASE_PORT=${BASE_PORT:-3000}|" \
+        -e "s|^Environment=RELAY_PROXY_AUTH=.*|Environment=RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH:-}|" \
         -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --sweep|" \
         systemd/warp-keep-cold.service > "$TMP_KEEP"
 

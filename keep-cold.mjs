@@ -294,6 +294,14 @@ function log(msg) {
 
 const RELAY_HOST = process.env.RELAY_HOST ?? "10.244.0.100";
 const BASE_PORT = envInt("BASE_PORT", 3000, { max: 65535 });
+// Direct public-IP ingress bakes RELAY_PROXY_AUTH into the relay containers;
+// the dispatch lanes now demand HTTP Basic Proxy-Authorization on EVERY
+// request with a target (health stays exempt), so the host prober must speak
+// it too — otherwise every probe 407s, every relay reads dirty and rotation
+// never happens. Supplied via the systemd unit's Environment= (setup.sh),
+// or `--env-file=.env` for manual runs; standalone mesh/tunnels installs
+// simply leave it unset.
+const RELAY_PROXY_AUTH = process.env.RELAY_PROXY_AUTH ?? "";
 const COUNT = envInt("COUNT", 10, { min: 1, max: 64 });
 const PROBE_TARGET = envUrl("PROBE_TARGET", "https://opencode.ai");
 const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/inference/v1/chat/completions");
@@ -857,7 +865,12 @@ async function probe(index, model) {
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: probeHeaders(relayPath, sid),
+      headers: {
+        ...probeHeaders(relayPath, sid),
+        ...(RELAY_PROXY_AUTH
+          ? { "proxy-authorization": `Basic ${Buffer.from(RELAY_PROXY_AUTH).toString("base64")}` }
+          : {}),
+      },
       body,
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
