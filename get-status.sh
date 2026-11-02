@@ -243,12 +243,10 @@ if [ "$FOUND_TUNNELS" -eq 0 ]; then
       MUX_URL="http://${AUTH_PREFIX}${CLIENT_IP}:3100"
       echo "Plain proxy URL (one for the whole pool): ${MUX_URL}"
       echo "/freeflow add ${MUX_URL} mux-all"
-      i=1
-      while [ "$i" -le "$COUNT" ]; do
-        RELAY_URL="http://${AUTH_PREFIX}${CLIENT_IP}:$((3100 + i))"
-        echo "/freeflow add ${RELAY_URL} relay-${i}"
-        i=$((i + 1))
-      done
+      echo ""
+      echo "One client URL, rota-style: :3100 muxes every relay internally; per-relay"
+      echo "lanes :3101..:$((3100 + COUNT)) exist behind the same credentials for manual"
+      echo "pinning/debugging only (curl -U '<user:pass>' -x http://${CLIENT_IP}:310N)."
       ADD_PRINTED=1
     else
       echo "=== Mesh-VPN direct commands (router bound on all interfaces) ==="
