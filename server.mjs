@@ -1,6 +1,7 @@
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Agent } from "undici";
@@ -38,10 +39,17 @@ const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "";
 // reads `http://user:pass@host` userinfo), which is why the public arm uses
 // it. The health path (no target) stays exempt: keep-cold and the mux probe
 // through it, and it answers only relay metadata, never upstream data.
-// timing-safety: string compare is fine at proxy scale; swap to
-// crypto.timingSafeEqual when this surface ever leaves a closed allowlist.
+// The public arm means credentials cross an untrusted network, so compare them
+// in constant time: hash both sides to a fixed 32 bytes first (timingSafeEqual
+// throws on unequal lengths, which would itself leak the secret's length).
 const RELAY_PROXY_AUTH = process.env.RELAY_PROXY_AUTH || "";
 const PROXY_AUTH_CHALLENGE = 'Basic realm="warp-relay-pool"';
+
+function secretEquals(given, expected) {
+  const a = createHash("sha256").update(String(given)).digest();
+  const b = createHash("sha256").update(String(expected)).digest();
+  return timingSafeEqual(a, b);
+}
 
 function proxyCredOk(req) {
   if (!RELAY_PROXY_AUTH) return true;
@@ -49,7 +57,7 @@ function proxyCredOk(req) {
   const space = header.indexOf(" ");
   if (!/^basic$/i.test(header.slice(0, space).trim())) return false;
   const decoded = Buffer.from(header.slice(space + 1), "base64").toString("utf8");
-  return decoded === RELAY_PROXY_AUTH;
+  return secretEquals(decoded, RELAY_PROXY_AUTH);
 }
 
 // Mux env ints arrive in seconds; clamp to sane bounds per knob.
@@ -113,7 +121,7 @@ function matchTarget(target) {
 function isAuthorized(req, match) {
   if (match.exact) return true;
   if (!RELAY_AUTH_TOKEN) return false;
-  return req.headers[HEADER_AUTH] === RELAY_AUTH_TOKEN;
+  return secretEquals(req.headers[HEADER_AUTH], RELAY_AUTH_TOKEN);
 }
 
 // Live rate-limit signals: report the egress/model that just answered 429 so
