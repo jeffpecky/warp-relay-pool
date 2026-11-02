@@ -27,8 +27,9 @@ proxy for anyone who can reach the listener. Pass the token via host env at
 generation time, never commit it, and keep relay ports on loopback or the
 Tailscale IP. Details: `docs/06-universal-proxy.md`.
 
-**No client authentication.** The relay trusts anyone who can reach a
-listener. Possession of a relay URL is enough to (a) make allowlisted
+**No client authentication (mesh and tunnel arms).** The relay trusts anyone
+who can reach a listener; direct public-IP ingress instead requires HTTP Basic
+(see below). Possession of a relay URL is enough to (a) make allowlisted
 upstream requests through that relay's egress IP and (b) read the relay's
 current egress IP from the built-in health check (a request without
 `x-relay-target` returns the Cloudflare trace for that egress). Treat relay
@@ -54,6 +55,19 @@ default: nothing is reachable from the internet unless you opt in.
   `http://user:pass@<public-ip>:310N` client lines as secrets: anyone
   holding that string shares the pool's egresses (same capability model
   as tunnel URLs). Raw WARP SOCKS ports stay loopback-bound in this mode.
+
+**Cleartext transport on the direct public-IP arm.** That listener is plain
+HTTP, so `Proxy-Authorization: Basic` is base64 rather than encryption — anyone
+on the path can recover `RELAY_PROXY_AUTH` and then use the pool. It exists for
+clients that cannot join a VPN, not as the supported production path. For real
+traffic use the Tailscale arm (WireGuard-encrypted, private port) or the
+TryCloudflare arm (public HTTPS). If you must use the public arm: keep the
+password long and random, rotate it if it may have crossed an untrusted
+network, and restrict reachability at the network tier with `DOCKER-USER`
+rules (see the port-publishing note below). This repo terminates no TLS; front
+`:3100` with your own CONNECT-capable TLS terminator if you need encryption to
+the client.
+
 - Overrides: `WARP_BIND=<addr> ./generate-compose.sh N` and
   `INGRESS_BIND=<addr> ./generate-compose.sh N` (default `127.0.0.1`).
   Binds are IPv4 only (an IPv6 value is rejected at generation time).
