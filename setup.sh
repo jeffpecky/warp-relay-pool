@@ -498,6 +498,40 @@ else
 fi
 
 # -------------------------------------------------------------
+# Live 429 signals: ON for a fresh install. The relay container gates them
+# on RELAY_AUTH_TOKEN (generate one when unset), and the host keep-cold
+# prober consumes them only with LIVE_SIGNALS=1. Both persist to .env, the
+# same single source the compose generator and the installed unit read.
+# -------------------------------------------------------------
+RELAY_AUTH_TOKEN="${RELAY_AUTH_TOKEN:-}"
+if [ -z "$RELAY_AUTH_TOKEN" ]; then
+  RELAY_AUTH_TOKEN="$(openssl rand -hex 16 2>/dev/null \
+    || head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' \
+    || date +%s%N | sha256sum 2>/dev/null | cut -c1-32)"
+  log_info "Auto-generated relay signal token (RELAY_AUTH_TOKEN): ${RELAY_AUTH_TOKEN}"
+fi
+export RELAY_AUTH_TOKEN
+if [ -f .env ] && grep -q '^RELAY_AUTH_TOKEN=' .env; then
+  sed -i.bak "s|^RELAY_AUTH_TOKEN=.*|RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN}|" .env && rm -f .env.bak
+else
+  printf '\nRELAY_AUTH_TOKEN=%s\n' "$RELAY_AUTH_TOKEN" >> .env
+fi
+chmod 600 .env 2>/dev/null || true
+case "${LIVE_SIGNALS:-}" in
+  0|f|false|off) LIVE_SIGNALS=0 ;;
+  *) LIVE_SIGNALS=1 ;;
+esac
+export LIVE_SIGNALS
+if [ -f .env ]; then
+  if grep -q '^LIVE_SIGNALS=' .env; then
+    sed -i.bak "s|^LIVE_SIGNALS=.*|LIVE_SIGNALS=${LIVE_SIGNALS}|" .env && rm -f .env.bak
+  else
+    printf 'LIVE_SIGNALS=%s\n' "$LIVE_SIGNALS" >> .env
+  fi
+fi
+log_info "Live 429 signals: LIVE_SIGNALS=${LIVE_SIGNALS} (clients report 429s to POST /signal; keep-cold repairs them)."
+
+# -------------------------------------------------------------
 # 4. Build Minimal MicroWARP & Relay Images
 # -------------------------------------------------------------
 # The generated compose intentionally drops SYS_MODULE. Ensure the host loads
@@ -639,6 +673,7 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
         -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
         -e "s|^Environment=BASE_PORT=.*|Environment=BASE_PORT=${BASE_PORT:-3000}|" \
         -e "s|^Environment=RELAY_PROXY_AUTH=.*|Environment=RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH:-}|" \
+        -e "s|^Environment=LIVE_SIGNALS=.*|Environment=LIVE_SIGNALS=${LIVE_SIGNALS}|" \
         -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --sweep|" \
         systemd/warp-keep-cold.service > "$TMP_KEEP"
 
@@ -695,5 +730,12 @@ echo "🔄 Rate-Limit Protection:"
 echo "   Every ${SWEEP_INTERVAL_MIN} minutes keep-cold sweeps all ${COUNT} relays. Any relay"
 echo "   answering HTTP 429 is restarted onto a fresh egress /64 and re-probed"
 echo "   until it streams again. Your public tunnel URLs never change!"
+echo ""
+echo "📡 Live 429 signals (LIVE_SIGNALS=${LIVE_SIGNALS}): tunnel-mode clients (9router)"
+echo "   POST the 429s they see to the relay; the lane's container rotates on the"
+echo "   next keep-cold pass. Clients use the token below (must match the relay's"
+echo "   RELAY_AUTH_TOKEN, auto-generated and saved to .env):"
+echo "   RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN}"
+echo "   Windows side (one line):  setx OPENCODE_RELAY_SIGNAL_TOKEN ${RELAY_AUTH_TOKEN}"
 echo "======================================================================="
 echo ""
