@@ -38,8 +38,12 @@ fi
 # mirror the generator's loopback binds when no compose file exists.
 SOCKS_BIND="$(sed -n 's/^ *- "\([^":]*\):[0-9][0-9]*:1080"$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 [ -n "$SOCKS_BIND" ] || SOCKS_BIND="127.0.0.1"
-ROUTER_PUBLISHED="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+ROUTER_PUBLISHED="$(sed -n 's/^ *- "\([^":]*\):3100-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 ROUTER_BIND="$ROUTER_PUBLISHED"
+# Direct public-IP ingress marker: compose bakes RELAY_DIRECT_PUBLIC=1 and
+# the Basic credentials, so client lines can be printed with embedded creds.
+DIRECT_PUBLIC="$(sed -n 's/^ *- RELAY_DIRECT_PUBLIC=1$/direct/p' docker-compose.yml 2>/dev/null | head -n 1)"
+PROXY_AUTH_VALUE="$(sed -n 's/^ *- RELAY_PROXY_AUTH=\([^"].*\)$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 BASE_PORT="$(sed -n 's/^ *- BASE_PORT=\([0-9][0-9]*\)$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 [ -n "$BASE_PORT" ] || BASE_PORT=3000
 
@@ -191,6 +195,10 @@ TS_IP="$(mesh_ip)"
 [ -z "$TS_IP" ] && TS_IP="<tailscale-ip>"
 
 FOUND_TUNNELS=0
+echo ""
+echo "Per-relay lines below are optional — manual pinning/debugging only."
+MUX_TUNNEL_URL="$(tunnel_url 0)"
+MUX_PRINTED=0
 i=1
 while [ "$i" -le "$COUNT" ]; do
   URL="$(tunnel_url "$i")"
@@ -201,6 +209,11 @@ while [ "$i" -le "$COUNT" ]; do
     fi
     FOUND_TUNNELS=1
     ADD_PRINTED=1
+    if [ -n "$MUX_TUNNEL_URL" ] && [ "$MUX_PRINTED" -eq 0 ]; then
+      MUX_PRINTED=1
+      echo "Plain proxy URL (one for the whole pool): ${MUX_TUNNEL_URL}"
+      echo "/freeflow add ${MUX_TUNNEL_URL} mux-all"
+    fi
     echo "/freeflow add ${URL} relay-${i}"
   fi
   i=$((i + 1))
@@ -219,16 +232,41 @@ if [ "$FOUND_TUNNELS" -eq 0 ]; then
     echo "=== Mesh-VPN direct: router bound to 127.0.0.1 (not reachable from the tailnet) ==="
     echo "(re-run: INGRESS_BIND=${TS_IP} ./generate-compose.sh ${COUNT} && docker compose up -d)"
   elif [ "$ROUTER_BIND" = "0.0.0.0" ]; then
-    echo "=== Mesh-VPN direct commands (router bound on all interfaces) ==="
-    i=1
-    while [ "$i" -le "$COUNT" ]; do
-      TS_PORT=$((3100 + i))
-      echo "/freeflow add http://${TS_IP}:${TS_PORT} relay-${i}"
-      i=$((i + 1))
-    done
-    ADD_PRINTED=1
+    if [ -n "$DIRECT_PUBLIC" ]; then
+      # Direct public-IP ingress: print the machine's public address with the
+      # Basic credentials embedded (ordinary proxy clients read userinfo).
+      CLIENT_IP="$(curl -4 -s -m 5 https://api.ipify.org 2>/dev/null || true)"
+      [ -z "$CLIENT_IP" ] && CLIENT_IP="$TS_IP"
+      AUTH_PREFIX=""
+      [ -n "$PROXY_AUTH_VALUE" ] && AUTH_PREFIX="${PROXY_AUTH_VALUE}@"
+      echo "=== Direct public-IP ingress on ${CLIENT_IP}:310N (proxy credentials enforced) ==="
+      MUX_URL="http://${AUTH_PREFIX}${CLIENT_IP}:3100"
+      echo "Plain proxy URL (one for the whole pool): ${MUX_URL}"
+      echo "/freeflow add ${MUX_URL} mux-all"
+      i=1
+      while [ "$i" -le "$COUNT" ]; do
+        RELAY_URL="http://${AUTH_PREFIX}${CLIENT_IP}:$((3100 + i))"
+        echo "/freeflow add ${RELAY_URL} relay-${i}"
+        i=$((i + 1))
+      done
+      ADD_PRINTED=1
+    else
+      echo "=== Mesh-VPN direct commands (router bound on all interfaces) ==="
+      MUX_URL="http://${TS_IP}:3100"
+      echo "Plain proxy URL (one for the whole pool): ${MUX_URL}"
+      echo "/freeflow add ${MUX_URL} mux-all"
+      i=1
+      while [ "$i" -le "$COUNT" ]; do
+        TS_PORT=$((3100 + i))
+        echo "/freeflow add http://${TS_IP}:${TS_PORT} relay-${i}"
+        i=$((i + 1))
+      done
+      ADD_PRINTED=1
+    fi
   else
     echo "=== Mesh-VPN direct commands (Tailscale private) ==="
+    echo "Plain proxy URL (one for the whole pool): http://${ROUTER_BIND}:3100"
+    echo "/freeflow add http://${ROUTER_BIND}:3100 mux-all"
     i=1
     while [ "$i" -le "$COUNT" ]; do
       TS_PORT=$((3100 + i))

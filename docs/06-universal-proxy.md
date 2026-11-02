@@ -6,6 +6,42 @@ arbitrary upstreams: wildcard/suffix/regex allowlist entries plus a shared
 token. Additive only — closed mode, keep-cold, and the probe path are
 untouched.
 
+## One-URL mux mode (default on)
+
+Since the pool can grow to N relays, tracking N client URLs is painful. The
+relay app therefore also listens as the **all-in-one mux** on the container
+`BASE_PORT` and the host port just below the instance range:
+
+    host 3100            = mux (ONE client URL for the whole pool)
+    host 3101..3100+N    = per-relay instances (unchanged)
+
+Client config needs exactly one URL — `http://100.72.14X.XX:3100` in mesh
+mode (host mapping is generated as `3100-3100+N:3000-3000+N`), or the
+`tunnel-0` Quick-Tunnel URL in tunnels mode (added by default).
+
+Policy, all client-invisible:
+
+- **Round-robin over health:** each connection lands on a spread-out relay
+  whose aggregate health check (`GET /` — the same egress-walking health
+  path) passed within the window. Failures (`probe`, connect-refused)
+  cool that relay for `RELAY_MUX_COOLDOWN_S` (default 240s) and a passing
+  probe re-admits it immediately.
+- **429-aware:** with `LIVE_SIGNALS=1` the mux also reads the signal file;
+  a relay that just answered 429 gets a short cooldown (`RELAY_MUX_429_S`,
+  default 120s, or the upstream `retry-after` clamped) so traffic hops to
+  a sibling egress while keep-cold does the slower real repair.
+- **Sticky egress:** connections from the same client IP prefer to stay
+  on the relay they used (`RELAY_MUX_STICKY_S`, default 600s), so OpenCode
+  free-tier per-`/64` counters stay per-client. Affinity is per peer
+  address, not per API key — see the ponytail note in `mux.mjs`.
+- **All-egress outage:** with no usable relay the mux answers plain
+  `HTTP 503 Retry-After: 30` instead of hanging clients.
+
+Turning it off: bake `RELAY_MUX=0` and regenerate. The per-port lanes and
+`.env` knobs are unchanged; the mux only adds one listener before
+`warp-1`.
+
+
 ## Allowlist entries
 
 `RELAY_ALLOWED_TARGETS` is a comma list. Each entry matches against the
@@ -90,3 +126,27 @@ the relay:
 - Quota note: 429 rotation and the keep-cold probe lane still target
   `PROBE_TARGET` (OpenCode Zen) only — universal traffic rides the same
   egress IPs but does not extend probing to new upstreams.
+
+## Direct public-IP ingress (wizard option 3)
+
+Binds the router to `0.0.0.0` and enforces **HTTP Basic proxy credentials**
+on every dispatched request and every CONNECT — exact-origin allowlist hits
+included (`407` without `Proxy-Authorization: Basic base64(user:pass)`,
+with the challenge header on both the request and tunnel paths). The
+no-target health path stays exempt so keep-cold and the mux probes keep
+working. Plain proxy clients (curl `-U user:pass`, browsers, and undici's
+ProxyAgent via `http://user:pass@host:port`) speak this natively — which is
+why the public arm uses it instead of `x-relay-auth`.
+
+Standards:
+- The generator fails closed: `RELAY_DIRECT_PUBLIC=1` without
+  `RELAY_PROXY_AUTH=user:pass` refuses to write a compose file.
+- `RELAY_PROXY_AUTH` is baked ONLY in direct mode (`RELAY_PROXY_AUTH_BAKED`
+  is empty otherwise), so the mesh/tunnels arms never inherit the gate.
+- The wizard persists both values in `.env` so later
+  `./generate-compose.sh N` runs keep the same credentials.
+- Client lines from `get-status.sh` carry the public IP (ipify) with the
+  credentials embedded (`http://user:pass@<public-ip>:310N`).
+- Raw WARP SOCKS ports (`10800+N`) stay on loopback; the pool's isolation
+  contract is the credential-gated router.
+

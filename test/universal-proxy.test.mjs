@@ -136,6 +136,9 @@ function spawnRelay(basePort, allowlist, token) {
     // Explicit empty string (not inherit) so no-token relays deterministically
     // exercise the fail-closed path even if the parent env sets a token.
     RELAY_AUTH_TOKEN: token || "",
+    // The mux is out of scope for this harness: its immediate health probe
+    // walks the real egress path and would pollute the CONNECT ledger.
+    RELAY_MUX: "0",
   };
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: REPO_ROOT,

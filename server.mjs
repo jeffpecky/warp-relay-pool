@@ -31,6 +31,33 @@ const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TA
 // closed instead of becoming an open proxy.
 const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "";
 
+// Direct public-IP ingress (RELAY_DIRECT_PUBLIC=1 + RELAY_PROXY_AUTH=user:pass):
+// a standard-proxy Basic gate enforced on EVERY dispatched request and every
+// CONNECT, exact-origin hits included. Unlike `x-relay-auth` this is
+// speakable by ordinary proxy clients (curl -U, browsers, undici ProxyAgent
+// reads `http://user:pass@host` userinfo), which is why the public arm uses
+// it. The health path (no target) stays exempt: keep-cold and the mux probe
+// through it, and it answers only relay metadata, never upstream data.
+// timing-safety: string compare is fine at proxy scale; swap to
+// crypto.timingSafeEqual when this surface ever leaves a closed allowlist.
+const RELAY_PROXY_AUTH = process.env.RELAY_PROXY_AUTH || "";
+const PROXY_AUTH_CHALLENGE = 'Basic realm="warp-relay-pool"';
+
+function proxyCredOk(req) {
+  if (!RELAY_PROXY_AUTH) return true;
+  const header = String(req.headers["proxy-authorization"] || "");
+  const space = header.indexOf(" ");
+  if (!/^basic$/i.test(header.slice(0, space).trim())) return false;
+  const decoded = Buffer.from(header.slice(space + 1), "base64").toString("utf8");
+  return decoded === RELAY_PROXY_AUTH;
+}
+
+// Mux env ints arrive in seconds; clamp to sane bounds per knob.
+function intEnv(raw, fallback) {
+  const n = parseInt(raw ?? "", 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 // Universal-proxy allowlist matcher. Each entry is one of:
 //   exact origin  ("https://opencode.ai")
 //   "*"           (any http/https origin)
@@ -341,6 +368,13 @@ function createRelayInstance(index) {
       res.writeHead(401, { "content-type": "application/json" });
       return res.end(JSON.stringify({ error: "Unauthorized" }));
     }
+    if (!proxyCredOk(req)) {
+      res.writeHead(407, {
+        "content-type": "application/json",
+        "proxy-authenticate": PROXY_AUTH_CHALLENGE,
+      });
+      return res.end(JSON.stringify({ error: "Proxy authentication required" }));
+    }
 
     // The allowlist check above only validates the raw header string; the
     // request URL is target + relayPath, and a crafted path can continue the
@@ -474,9 +508,11 @@ function createRelayInstance(index) {
   server.on("connect", (req, clientSocket, head) => {
     req.on("error", () => {});
     clientSocket.on("error", () => {});
-    const deny = (code, text) => {
+    const deny = (code, text, extraHeaders = "") => {
       try {
-        clientSocket.write(`HTTP/1.1 ${code} ${text}\r\nContent-Length: 0\r\n\r\n`);
+        clientSocket.write(
+          `HTTP/1.1 ${code} ${text}\r\nContent-Length: 0\r\n${extraHeaders}\r\n`
+        );
       } catch {
         // Ignored: the client is already gone.
       }
@@ -522,6 +558,10 @@ function createRelayInstance(index) {
     }
     if (!isAuthorized(req, match)) {
       deny(401, "Unauthorized");
+      return;
+    }
+    if (!proxyCredOk(req)) {
+      deny(407, "Proxy Authentication Required", `Proxy-Authenticate: ${PROXY_AUTH_CHALLENGE}\r\n`);
       return;
     }
     if (portNum !== 443 && portNum !== 80) {
@@ -579,6 +619,25 @@ function createRelayInstance(index) {
 
 for (let i = 1; i <= COUNT; i++) {
   createRelayInstance(i);
+}
+
+// All-in-one mux listener (mux.mjs): ONE client port that internally spreads
+// across every instance's listener above. Disabled with RELAY_MUX=0. It
+// listens on BASE_PORT itself; instance ports (BASE_PORT+1..) are untouched.
+const RELAY_MUX_ENABLED = process.env.RELAY_MUX !== "0";
+if (RELAY_MUX_ENABLED) {
+  const { startMux } = await import("./mux.mjs");
+  const mux = startMux({
+    basePort: BASE_PORT,
+    count: COUNT,
+    signalFile: LIVE_SIGNALS ? LIVE_SIGNAL_FILE : null,
+    probeIntervalMs: intEnv(process.env.RELAY_MUX_PROBE_S, 30) * 1000,
+    cooldownMs: intEnv(process.env.RELAY_MUX_COOLDOWN_S, 240) * 1000,
+    cooldown429Ms: intEnv(process.env.RELAY_MUX_429_S, 120) * 1000,
+    stickyMs: intEnv(process.env.RELAY_MUX_STICKY_S, 600) * 1000,
+    log: (msg) => console.log(msg),
+  });
+  servers.push(mux.server);
 }
 
 // Drain on deploy: stop accepting, let in-flight streams finish, then force

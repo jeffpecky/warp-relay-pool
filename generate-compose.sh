@@ -6,7 +6,8 @@
 #
 # Default (pure) mode: warp-1..N on minimal MicroWARP (warp-lite: ~1.8 MiB RAM each),
 # each with `ports: "<10800+i>:1080"` (raw proxy), plus one relay app at 10.244.0.100
-# with `ports: "3101-<3100+N>:3001-<3000+N>"` for mesh-VPN direct ingress.
+# with `ports: "3100-<3100+N>:3000-<3000+N>"` for mesh-VPN direct ingress
+# (host 3100 = mux all-in-one listener; 3101..3100+N = per-relay instances).
 # With --with-tunnels: appends tunnel-1..N (Quick Tunnel -> http://10.244.0.100:300N).
 # With --legacy-warp: uses caomingjun/warp:latest (~100 MiB each) instead of warp-lite.
 # Rotation rule: restart warp-N only, never tunnel-N/relay.
@@ -84,9 +85,26 @@ if [ "$BASE_PORT" -lt 1 ] || [ $((BASE_PORT + COUNT)) -gt 65535 ]; then
   echo "error: BASE_PORT+COUNT must be <= 65535, got $((BASE_PORT + COUNT))" >&2
   exit 1
 fi
-HOST_LO=$((3100 + 1))
+# Direct public-IP ingress: RELAY_DIRECT_PUBLIC=1 must carry proxy credentials,
+# otherwise an unauthenticated proxy is published to the internet.
+RELAY_DIRECT_PUBLIC="${RELAY_DIRECT_PUBLIC:-0}"
+RELAY_PROXY_AUTH="${RELAY_PROXY_AUTH:-}"
+RELAY_PROXY_AUTH_BAKED=""
+if [ "$RELAY_DIRECT_PUBLIC" = "1" ]; then
+  RELAY_PROXY_AUTH_BAKED="$RELAY_PROXY_AUTH"
+fi
+if [ "$RELAY_DIRECT_PUBLIC" = "1" ] && [ -z "$RELAY_PROXY_AUTH" ]; then
+  echo "error: RELAY_DIRECT_PUBLIC=1 requires RELAY_PROXY_AUTH=user:pass (Basic proxy credentials)." >&2
+  echo "       A public router without credentials is an open proxy." >&2
+  exit 1
+fi
+
+HOST_LO=$((3100))
 HOST_HI=$((3100 + COUNT))
-CONT_LO=$((BASE_PORT + 1))
+# Mux (all-in-one) rides host 3100 -> container BASE_PORT; instances stay on
+# 3101..3100+N -> BASE_PORT+1..BASE_PORT+COUNT. Assumes the project's standard
+# container base of 3000 (host offset +100).
+CONT_LO=$((BASE_PORT))
 CONT_HI=$((BASE_PORT + COUNT))
 
 # Host binds default to loopback: the SOCKS proxies are unauthenticated and
@@ -225,6 +243,13 @@ cat <<ENTRY
     environment:
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
+      - RELAY_MUX=${RELAY_MUX:-1}
+      - RELAY_MUX_PROBE_S=${RELAY_MUX_PROBE_S:-30}
+      - RELAY_MUX_COOLDOWN_S=${RELAY_MUX_COOLDOWN_S:-240}
+      - RELAY_MUX_429_S=${RELAY_MUX_429_S:-120}
+      - RELAY_MUX_STICKY_S=${RELAY_MUX_STICKY_S:-600}
+      - RELAY_DIRECT_PUBLIC=${RELAY_DIRECT_PUBLIC:-0}
+      - RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH_BAKED:-}
       - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
@@ -250,6 +275,13 @@ cat <<ENTRY
     environment:
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
+      - RELAY_MUX=${RELAY_MUX:-1}
+      - RELAY_MUX_PROBE_S=${RELAY_MUX_PROBE_S:-30}
+      - RELAY_MUX_COOLDOWN_S=${RELAY_MUX_COOLDOWN_S:-240}
+      - RELAY_MUX_429_S=${RELAY_MUX_429_S:-120}
+      - RELAY_MUX_STICKY_S=${RELAY_MUX_STICKY_S:-600}
+      - RELAY_DIRECT_PUBLIC=${RELAY_DIRECT_PUBLIC:-0}
+      - RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH_BAKED:-}
       - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
@@ -295,6 +327,21 @@ cat <<ENTRY
 ENTRY
 i=$((i + 1))
 done
+# tunnel-0 -> the mux port: one public URL for the whole pool.
+PORT=$((BASE_PORT))
+cat <<ENTRY
+  tunnel-0:
+    image: cloudflare/cloudflared:latest
+    container_name: warp-relay-tunnel-0
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: tunnel --no-autoupdate --url http://10.244.0.100:${PORT}
+
+ENTRY
 fi
 
 if [ "$USE_LITE" = true ]; then

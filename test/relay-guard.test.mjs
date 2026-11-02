@@ -202,6 +202,9 @@ before(async () => {
       BASE_PORT: String(BASE_PORT),
       WARP_HOST_1: "127.0.0.1",
       WARP_PORT_1: String(sinkPort),
+      // Mux out of scope: its health probe walks the real egress path and
+      // would pollute dispatch counts.
+      RELAY_MUX: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -254,6 +257,8 @@ before(async () => {
       RELAY_ALLOWED_TARGETS: `http://127.0.0.1:${upstream.address().port}`,
       LIVE_SIGNALS: "1",
       LIVE_SIGNAL_FILE: signalFile,
+      // Mux out of scope: health-probe traffic would pollute record counts.
+      RELAY_MUX: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

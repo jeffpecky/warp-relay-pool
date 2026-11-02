@@ -124,6 +124,9 @@ Applies to both tracks; full model and reporting in [SECURITY.md](SECURITY.md):
 Closed mode above is the default. Track A detail (allowlist entry shapes,
 `RELAY_AUTH_TOKEN` / `x-relay-auth`, `CONNECT` / absolute-form usage, quota
 and egress notes) lives in [docs/06-universal-proxy.md](docs/06-universal-proxy.md).
+Mesh-VPN deployments also expose the **all-in-one mux** on the host port
+just below the relay range — one URL for the whole pool, health/429-aware
+internally — see "One-URL mux mode" there.
 
 ---
 

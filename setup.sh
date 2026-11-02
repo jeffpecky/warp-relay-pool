@@ -315,6 +315,8 @@ DEPLOYED_COUNT="$(docker inspect warp-relay-app --format '{{range .Config.Env}}{
 DEPLOYED_INGRESS=""
 if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'warp-relay-tunnel-1'; then
   DEPLOYED_INGRESS="tunnels"
+elif grep -q '^ *- RELAY_DIRECT_PUBLIC=1' docker-compose.yml 2>/dev/null; then
+  DEPLOYED_INGRESS="direct"
 elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'warp-relay-app'; then
   DEPLOYED_INGRESS="tailscale"
 fi
@@ -363,7 +365,8 @@ fi
 if [ "$AUTO_YES" = true ]; then
   log_info "Non-interactive mode (-y): using count = ${COUNT} relays."
   case "$INGRESS_CHOICE" in
-    1|tailscale) log_info "Ingress method: Mesh-VPN direct (router bind resolved at generation)." ;;
+    2|tailscale) log_info "Ingress method: Mesh-VPN direct (router bind resolved at generation)." ;;
+    3|direct) log_info "Ingress method: Direct Public IP (0.0.0.0, proxy-auth enforced)." ;;
     *) log_info "Ingress method: TryCloudflare Quick Tunnels (public HTTPS URLs)." ;;
   esac
 else
@@ -379,27 +382,32 @@ else
   DEFAULT_INGRESS_NUM=1
   case "$INGRESS_CHOICE" in
     2|tailscale) DEFAULT_INGRESS_NUM=2 ;;
+    3|direct) DEFAULT_INGRESS_NUM=3 ;;
   esac
   if [ "$TAILSCALE_DETECTED" = true ]; then
     echo "  1) TryCloudflare Quick Tunnels (Recommended: public HTTPS, zero client VPN needed)"
     echo "  2) Tailscale Mesh-VPN Direct (Private static URL via ${TS_IP})"
-    printf "Choose ingress method [1/2, default: %s]: " "$DEFAULT_INGRESS_NUM"
+    echo "  3) Direct Public IP (binds the router to 0.0.0.0; proxy credentials REQUIRED)"
+    printf "Choose ingress method [1/2/3, default: %s]: " "$DEFAULT_INGRESS_NUM"
     read -r user_ingress || true
     if [ -n "$user_ingress" ]; then
       case "$user_ingress" in
         2) INGRESS_CHOICE="tailscale" ;;
         1) INGRESS_CHOICE="tunnels" ;;
+        3) INGRESS_CHOICE="direct" ;;
       esac
     fi
   else
     echo "  1) TryCloudflare Quick Tunnels (Recommended: public HTTPS, zero client configuration)"
     echo "  2) Tailscale Mesh-VPN Direct (requires Tailscale on VPS + local machine)"
-    printf "Choose ingress method [1/2, default: %s]: " "$DEFAULT_INGRESS_NUM"
+    echo "  3) Direct Public IP (binds the router to 0.0.0.0; proxy credentials REQUIRED)"
+    printf "Choose ingress method [1/2/3, default: %s]: " "$DEFAULT_INGRESS_NUM"
     read -r user_ingress || true
     if [ -n "$user_ingress" ]; then
       case "$user_ingress" in
         2) INGRESS_CHOICE="tailscale" ;;
         1) INGRESS_CHOICE="tunnels" ;;
+        3) INGRESS_CHOICE="direct" ;;
       esac
     fi
   fi
@@ -430,8 +438,53 @@ if [ "$INGRESS_CHOICE" = "tunnels" ] || [ "$INGRESS_CHOICE" = "1" ]; then
   WITH_TUNNELS_FLAG="--with-tunnels"
   log_info "Selected: TryCloudflare Quick Tunnels (${COUNT} relays)."
 else
-  log_info "Selected: Tailscale Mesh-VPN direct (${COUNT} relays)."
-  if [ -n "$TS_IP" ]; then
+  if [ "$INGRESS_CHOICE" = "direct" ]; then
+    # Public router bind: every dispatch (exact origins included) and CONNECT
+    # is gated on HTTP Basic Proxy-Authorization. Health stays exempt.
+    INGRESS_BIND="0.0.0.0"
+    export INGRESS_BIND
+    RELAY_DIRECT_PUBLIC=1
+    export RELAY_DIRECT_PUBLIC
+    gen_pass() {
+      openssl rand -hex 12 2>/dev/null \
+        || head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' \
+        || date +%s%N | sha256sum 2>/dev/null | cut -c1-24
+    }
+    if [ -z "${RELAY_PROXY_AUTH:-}" ]; then
+      if [ "$AUTO_YES" = true ]; then
+        RELAY_PROXY_AUTH="runner:$(gen_pass)"
+        log_info "Auto-generated proxy credentials: ${RELAY_PROXY_AUTH}"
+      else
+        printf "Proxy username [runner]: "
+        read -r BASIC_USER || true
+        BASIC_USER="${BASIC_USER:-runner}"
+        printf "Proxy password (blank = auto-generate): "
+        read -r BASIC_PASS || true
+        if [ -z "$BASIC_PASS" ]; then
+          BASIC_PASS="$(gen_pass)"
+          log_info "Generated password: ${BASIC_PASS}"
+        fi
+        RELAY_PROXY_AUTH="${BASIC_USER}:${BASIC_PASS}"
+      fi
+    fi
+    export RELAY_PROXY_AUTH
+    # Persist to .env so later `./generate-compose.sh N` regenerations keep
+    # the same credentials + direct mode instead of demanding the env
+    # outlive this shell.
+    if [ -f .env ] && grep -q '^RELAY_PROXY_AUTH=' .env; then
+      sed -i.bak "s|^RELAY_PROXY_AUTH=.*|RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH}|" .env && rm -f .env.bak
+    else
+      printf '\nRELAY_PROXY_AUTH=%s\n' "$RELAY_PROXY_AUTH" >> .env
+    fi
+    if [ -f .env ] && grep -q '^RELAY_DIRECT_PUBLIC=' .env; then
+      sed -i.bak "s|^RELAY_DIRECT_PUBLIC=.*|RELAY_DIRECT_PUBLIC=1|" .env && rm -f .env.bak
+    else
+      printf 'RELAY_DIRECT_PUBLIC=1\n' >> .env
+    fi
+    log_info "Selected: Direct Public IP (${COUNT} relays). Router on 0.0.0.0:310N — proxy-auth enforced."
+    log_warn "Public ingress: keep WARP_BIND on loopback (default) and treat the"
+    log_warn "credentials like a password — anyone with them shares your egresses."
+  elif [ -n "$TS_IP" ]; then
     INGRESS_BIND="$TS_IP"
     export INGRESS_BIND
     log_info "Relay router will be published on ${TS_IP} only (Tailscale interface)."

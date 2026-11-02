@@ -45,6 +45,15 @@ default: nothing is reachable from the internet unless you opt in.
   `setup.sh` sets `INGRESS_BIND` to the VPS Tailscale IP. In tunnels mode
   it is not host-published at all — tunnels reach it in-network at
   `http://10.244.0.100:300N`.
+- **Direct public-IP ingress (`RELAY_DIRECT_PUBLIC=1`)** publishes the
+  router range on `0.0.0.0`, so the generator refuses to write the file
+  unless `RELAY_PROXY_AUTH=user:pass` is set. Every dispatched request and
+  CONNECT then requires HTTP Basic `Proxy-Authorization` (`407` +
+  challenge otherwise) — exact-origin allowlist hits included; only the
+  no-target health path is exempt. Treat the printed
+  `http://user:pass@<public-ip>:310N` client lines as secrets: anyone
+  holding that string shares the pool's egresses (same capability model
+  as tunnel URLs). Raw WARP SOCKS ports stay loopback-bound in this mode.
 - Overrides: `WARP_BIND=<addr> ./generate-compose.sh N` and
   `INGRESS_BIND=<addr> ./generate-compose.sh N` (default `127.0.0.1`).
   Binds are IPv4 only (an IPv6 value is rejected at generation time).
