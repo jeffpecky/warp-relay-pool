@@ -1,5 +1,11 @@
 # Signal-driven warp pool rotation — Implementation Plan
 
+> **SUPERSEDED 2026-11-02 (user decision):** `--watch` mode is NOT built, and the
+> 9router→relay signal path is REMOVED entirely (see `2026-11-02-wreq-probe-keep-cold-design.md`).
+> Detection = keep-cold probes with wreq-js Bun-fingerprint transport (Tasks 1–2, executed as
+> written); cadence = systemd timer at 2 min for ≤10-relay pools. Task 3 (watch mode) dropped;
+> Task 4 reduced to timer interval + wreq-js install; Task 5 n/a (no signals).
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Rotation latency from ≤5 min to seconds: keep-cold becomes a signal-driven watcher (`--watch`) whose verification probes ride the same wreq-js Bun TLS fingerprint as real client traffic.

@@ -606,8 +606,12 @@ fi
 # streams again. At 20 relays a throttled round realistically needs more than
 # 5 minutes, so the timer period is sized to the pool: 5 minutes up to 10
 # relays, 15 minutes above that. flock -n still skips a fire that arrives while
-# the previous sweep is running.
-if [ "${COUNT:-5}" -gt 10 ]; then SWEEP_INTERVAL_MIN=15; else SWEEP_INTERVAL_MIN=5; fi
+# the previous sweep is running. The 2-minute default for small pools keeps
+# repair latency tight; incremental passes only probe suspects + the audit
+# sample, so the tick stays cheap steady-state.
+if [ "${SWEEP_INTERVAL_MIN:-}" = "" ]; then
+  if [ "${COUNT:-5}" -gt 10 ]; then SWEEP_INTERVAL_MIN=15; else SWEEP_INTERVAL_MIN=2; fi
+fi
 if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -lt 18 ]; then
   log_warn "Node.js $("$NODE_BIN" -v) is older than 18; the prober needs >=18. Skipping the timers."
 fi
@@ -626,9 +630,19 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
 
   if [ "$SETUP_SYSTEMD" = true ]; then
     log_info "Configuring systemd keep-cold and logwatch services..."
+    # keep-cold's probe transport prefers wreq-js (Bun-fingerprint ClientHello
+    # through the lane egress - the same simulation the clients perform).
+    # Best-effort install into the checkout next to keep-cold.mjs; if it
+    # cannot be installed the prober keeps running and logs
+    # "probe transport: wreq unavailable ... - legacy fallback".
+    CURRENT_DIR="$(pwd)"
+    if (cd "$CURRENT_DIR" && npm install --no-audit --no-fund --loglevel=error >/dev/null 2>&1); then
+      log_info "keep-cold dependencies (wreq-js probe transport) installed."
+    else
+      log_warn "npm install failed - keep-cold will probe with the legacy relay-terminated transport."
+    fi
     CURRENT_USER="$(id -un)"
     CURRENT_GROUP="$(id -gn)"
-    CURRENT_DIR="$(pwd)"
 
     TMP_KEEP="$(mktemp)"
     sed -e "s|^User=.*|User=${CURRENT_USER}|" \
