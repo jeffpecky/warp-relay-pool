@@ -350,39 +350,6 @@ function createRelayInstance(index) {
     // Direct health check: only when NO x-relay-target header is passed
     // (and the request line is not absolute-form). Exempt from the token gate.
     if (!target) {
-      // Live-signal intake for tunnel-mode clients (e.g. a TLS-impersonating
-      // fetch layer that CONNECTs — the relay can't see its upstream status,
-      // but the client can). Token-gated; the instance records the signal
-      // under its own index, so attribution follows whatever lane the client
-      // pointed this POST at (direct lane port, or the mux's sticky pick for
-      // the client's peer). Never forwarded upstream.
-      if (req.method === "POST" && req.url === "/signal") {
-        if (signalWriter && RELAY_AUTH_TOKEN && req.headers[HEADER_AUTH] === RELAY_AUTH_TOKEN) {
-          try {
-            const chunks = [];
-            for await (const chunk of req) chunks.push(chunk);
-            const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
-            const status = Number(body?.status) || 429;
-            signalWriter.record({
-              relay: index,
-              model: typeof body?.model === "string" ? body.model : "unknown",
-              status,
-              retryAfter: Number.isFinite(Number(body?.retryAfter)) ? Number(body.retryAfter) : null,
-            });
-            res.writeHead(204);
-          } catch (err) {
-            console.error(`[relay #${index}] signal intake failed: ${err?.code || err?.message || String(err)}`);
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: "Invalid signal payload" }));
-          }
-        } else {
-          // Signals disabled or unauthenticated: keep the shape stable for clients.
-          res.writeHead(202, { "content-type": "application/json" });
-          res.end(JSON.stringify({ accepted: false }));
-        }
-        return;
-      }
-
       try {
         const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
           dispatcher,
