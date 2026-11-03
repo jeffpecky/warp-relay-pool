@@ -127,6 +127,11 @@
  *                       (legacy headers + tools + timestamp system prompt,
  *                       no env block), or minimal (relay-only, no
  *                       fingerprint headers/tools)
+ *   PROBE_DIRECT        probe from this host's own egress instead of a lane
+ *                       (diagnostic: separates egress throttling from shape)
+ *   PROBE_PROJECT       x-opencode-project value (default "global"; the free
+ *                       tier appears to meter quota per project, so a unique
+ *                       hash may hold its own budget)
  *   GLOBAL_QUOTA_GUARD  relays-throttled threshold at which a model counts as
  *                       upstream quota (default max(8, COUNT-1), capped at COUNT)
  *   SERVER_ERROR_RETRY  same-egress re-probes before a server_error rotation
@@ -503,9 +508,11 @@ function shortReason(e) {
 // values mirror 9router's opencode executor (the only client known to pass),
 // so a probe 429 means throttling rather than a rejected shape.
 const OPENCODE_CLIENT = "cli";
-// 9router sends the literal "global" unless the downstream client supplies a
-// project hash; upstream accepts both. Keep the same constant it uses.
-const OPENCODE_PROJECT = "global";
+// My best guess: free quota is accounted per project, because 9router defaults
+// to the literal "global" and a real CLI sends a hash of its git remote, so a
+// shared default can be burnt out by other users while a unique hash keeps its
+// own budget. PROBE_PROJECT overrides it for a one-shot test.
+const OPENCODE_PROJECT = process.env.PROBE_PROJECT ?? "global";
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /** `ses_` + 12 hex + 14 alphanumeric, the shape the upstream gate validates. */
@@ -994,10 +1001,15 @@ async function wreqSession(index, wreq) {
   // relay-wide router; empty RELAY_PROXY_AUTH means a mesh install without
   // credentials (the probe then rides the unauthenticated lane shape).
   const authority = RELAY_PROXY_AUTH ? `${RELAY_PROXY_AUTH}@` : "";
-  const proxy = `http://${authority}${RELAY_HOST}:${BASE_PORT + index}`;
+  // PROBE_DIRECT=1 drops the lane proxy so the same request rides this host's
+  // own egress. Diagnostic only: distinguishes "every WARP egress is throttled"
+  // from "the probe shape is still wrong".
+  const proxy = process.env.PROBE_DIRECT === "1"
+    ? null
+    : `http://${authority}${RELAY_HOST}:${BASE_PORT + index}`;
   entry = wreq.createSession({
     emulation: { tlsOptions: { ...WREQ_TLS_PROFILE, alpnProtocols: [...WREQ_TLS_PROFILE.alpnProtocols] } },
-    proxy,
+    ...(proxy ? { proxy } : {}),
   });
   wreqSessions.set(index, entry);
   return entry;
