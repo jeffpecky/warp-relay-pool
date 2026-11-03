@@ -924,16 +924,27 @@ async function wreqAvailable() {
   // Test hook: deterministic unavailability regardless of what the host
   // happens to have installed globally (fake-relay scenarios must not ride).
   if (process.env.KEEP_COLD_PROBE_WREQ_FAILFAST === "1") {
-    log("probe transport: wreq unavailable (test failfast) - legacy fallback");
-    return null;
+    throw new Error("test failfast (KEEP_COLD_PROBE_WREQ_FAILFAST=1)");
   }
+  const wreq = await import("wreq-js");
+  if (typeof wreq?.createSession !== "function") throw new Error("missing createSession");
+  return wreq;
+}
+
+/** Transport choice for the opencode gate: measurable truth about the egress
+ * comes from speaking its ClientHello. wreq-js is REQUIRED for auto/wreq on
+ * opencode.ai targets — no silent degrade to relay-terminated probes (a
+ * "clean" verdict measured on a different TLS identity lies). Explicit
+ * PROBE_TRANSPORT=legacy stays a user choice; anything else fatal-exits. */
+async function pickProbeTransport() {
+  if (PROBE_TRANSPORT === "legacy" || !PROBE_TARGET.includes("opencode.ai")) return "legacy";
   try {
-    const wreq = await import("wreq-js");
-    if (typeof wreq?.createSession !== "function") throw new Error("missing createSession");
-    return wreq;
+    return { wreq: await wreqAvailable() };
   } catch (e) {
-    log(`probe transport: wreq unavailable (${String(e?.message ?? e).slice(0, 120)}) - legacy fallback`);
-    return null;
+    console.error(
+      `keep-cold: fatal - probe transport '${PROBE_TRANSPORT}' requires wreq-js but it is unavailable: ${String(e?.message ?? e).slice(0, 150)}. Install it in this checkout: npm install (or run with PROBE_TRANSPORT=legacy to accept relay-terminated probes).`,
+    );
+    process.exit(2);
   }
 }
 
@@ -958,17 +969,6 @@ function closeWreqSession(index) {
   if (!entry) return;
   wreqSessions.delete(index);
   Promise.resolve(entry).then((s) => s?.close?.()).catch(() => {});
-}
-
-/** Transport choice for the opencode gate: measurable truth about the egress
- * comes from speaking its ClientHello, so prefer wreq when the module exists;
- * anything else (non-opencode targets, forced legacy) stays relay-terminated.
- * The wreq-unavailable fallback is logged once per process (wreqAvailable). */
-async function pickProbeTransport() {
-  if (PROBE_TRANSPORT === "legacy" || !PROBE_TARGET.includes("opencode.ai")) return "legacy";
-  const wreq = await wreqAvailable();
-  if (!wreq) return "legacy";
-  return { wreq };
 }
 
 async function probe(index, model) {

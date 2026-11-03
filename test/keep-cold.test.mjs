@@ -1253,17 +1253,19 @@ test("PROBE_TRANSPORT=legacy probes the relay-terminated lane as before", async 
   assert.doesNotMatch(r.stdout, /probe transport/);
 });
 
-test("PROBE_TRANSPORT=wreq on a wreq-less host falls back to legacy with an explicit log line", async () => {
+test("PROBE_TRANSPORT=wreq on a wreq-less host is fatal, not a silent degrade", async () => {
   const sc = newScenario({ count: 1 });
   await startRelays(sc);
   const logPath = path.join(sc.dir, "relay-1.log");
+  const before = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
   const r = await runOnce(
     sc,
     { TARGET_MODEL: "model-a", PROBE_TRANSPORT: "wreq", KEEP_COLD_PROBE_WREQ_FAILFAST: "1" },
     ["--probe"],
   );
-  assert.equal(r.code, 0, r.stdout + r.stderr);
-  assert.match(r.stdout, /probe transport: wreq unavailable .* - legacy fallback/, "fallback is loud, not silent");
-  const req = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
-  assert.equal(req.relayTarget, "https://opencode.ai", "fallback executes the legacy probe");
+  assert.equal(r.code, 2, `expected fatal exit 2, got ${r.code}\n${r.stdout}${r.stderr}`);
+  assert.match(r.stdout + r.stderr, /fatal - probe transport 'wreq' requires wreq-js/, "fatal is loud, names the fix");
+  assert.doesNotMatch(r.stdout + r.stderr, /legacy fallback/, "no silent fallback line may appear");
+  const after = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
+  assert.equal(before, after, "no probe may execute without the truthful transport");
 });

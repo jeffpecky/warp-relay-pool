@@ -36,14 +36,15 @@ the verdict a real client would get from that egress.
    `<env>` block the gate enforces (Nov-02 gate law), so a 429 is attributable to egress quota,
    not probe shape.
 2. `feat(keep-cold): wreq-js probe transport` — `PROBE_TRANSPORT=auto|legacy|wreq` (fail-fast);
-   auto prefers wreq for opencode.ai targets; per-lane sessions are closed on rotation so no
-   pooled connection probes a replaced egress; legacy relay-terminated transport stays as
-   explicit and fallback mode with a loud log line; test hook
-   `KEEP_COLD_PROBE_WREQ_FAILFAST=1` for deterministic fallback tests.
+   auto requires wreq for opencode.ai targets and fatal-exits (code 2, loud message naming the
+   fix) when the module is missing — NO silent degrade to relay-terminated probes; legacy is
+   explicit opt-in only; per-lane sessions are closed on rotation so no pooled connection probes
+   a replaced egress; test hook `KEEP_COLD_PROBE_WREQ_FAILFAST=1` for deterministic
+   unavailability tests.
 3. Cadence: `SWEEP_INTERVAL_MIN` default 2 for pools ≤10 relays, 15 above (setup.sh; env pinned
    wins).
-4. `wreq-js` dependency in `package.json` + best-effort `npm install` during setup; failure
-   degrades to legacy probes with a warning, nobody stranded.
+4. `wreq-js` dependency in `package.json` + `npm install` during setup; failure → keep-cold
+   fatal-exits until wreq-js installed (no fallback probes).
 
 ## Explicitly not built
 
@@ -55,7 +56,8 @@ the verdict a real client would get from that egress.
 
 ## Testing
 
-- Unit (56/0): opener-first probe body, transport selection + legacy fallback, signal consumption
+- Unit (56/0): opener-first probe body, transport selection (wreq required for auto on the
+  opencode gate; missing module = fatal exit 2), signal consumption
   behaviors, sweep/reset ladders untouched.
 - VPS manual check: `npm install` on host, `node keep-cold.mjs --probe` shows wreq verdicts;
   compare against a live 9router request on the same lane seconds apart (both 200 or both 429).

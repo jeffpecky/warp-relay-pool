@@ -630,16 +630,15 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
 
   if [ "$SETUP_SYSTEMD" = true ]; then
     log_info "Configuring systemd keep-cold and logwatch services..."
-    # keep-cold's probe transport prefers wreq-js (Bun-fingerprint ClientHello
-    # through the lane egress - the same simulation the clients perform).
-    # Best-effort install into the checkout next to keep-cold.mjs; if it
-    # cannot be installed the prober keeps running and logs
-    # "probe transport: wreq unavailable ... - legacy fallback".
+    # keep-cold's probe transport REQUIRES wreq-js (Bun-fingerprint ClientHello
+    # through the lane egress - the same simulation the clients perform); a
+    # probe verdict on any other TLS identity would be a lie, so missing wreq-js
+    # makes keep-cold exit fatally rather than probe with degraded semantics.
     CURRENT_DIR="$(pwd)"
     if (cd "$CURRENT_DIR" && npm install --no-audit --no-fund --loglevel=error >/dev/null 2>&1); then
       log_info "keep-cold dependencies (wreq-js probe transport) installed."
     else
-      log_warn "npm install failed - keep-cold will probe with the legacy relay-terminated transport."
+      log_warn "npm install failed - install wreq-js manually (cd ${CURRENT_DIR} && npm install); without it keep-cold refuses to probe (fatal, not fallback)."
     fi
     CURRENT_USER="$(id -un)"
     CURRENT_GROUP="$(id -gn)"
