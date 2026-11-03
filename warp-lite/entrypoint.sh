@@ -323,6 +323,46 @@ bring_up_wg() {
     fi
 }
 
+# WARP anycast endpoints occasionally stop answering for a given client IP
+# while the registration stays valid, so a lane can sit at handshake=0
+# forever on the endpoint baked into its compose env (seen on 162.159.192.1 /
+# 193.1 / 193.2 while 194/195.x and 188.114.9x stayed healthy). Same keys,
+# different entry point: no new Cloudflare registration is spent.
+wait_handshake() {
+    waited=0
+    while [ "$waited" -lt "$1" ]; do
+        hs="$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2+0}')"
+        [ "${hs:-0}" -gt 0 ] && return 0
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
+
+ensure_handshake() {
+    if wait_handshake "${HANDSHAKE_WAIT_S:-12}"; then
+        log "handshake ok on configured endpoint"
+        return 0
+    fi
+    peer="$(wg show "$WG_IFACE" peers 2>/dev/null | head -n 1)"
+    if [ -z "$peer" ]; then
+        warn "handshake failover: no peer in ${WG_CONF}, skipping"
+        return 1
+    fi
+    for ep in 162.159.195.1:2408 188.114.96.1:2408 188.114.99.1:2408 162.159.192.8:2408 162.159.193.8:2408; do
+        log "no handshake yet; trying alternate endpoint ${ep}"
+        sed -i "s|^[[:space:]]*Endpoint[[:space:]]*=.*|Endpoint = ${ep}|" "$WG_CONF" 2>/dev/null || true
+        pin_wg_endpoint_route >/dev/null 2>&1 || true
+        wg set "$WG_IFACE" peer "$peer" endpoint "$ep" 2>/dev/null || continue
+        if wait_handshake 8; then
+            log "handshake ok via ${ep}"
+            return 0
+        fi
+    done
+    warn "handshake failover: no endpoint answered; keeping config (keep-cold will retry)"
+    return 1
+}
+
 # Pin the WireGuard endpoint host route via the pre-WARP gateway so tunnel
 # handshake/keepalive packets never loop into wg0 once the main-table
 # default moves onto the tunnel. Resolves the configured Endpoint host
@@ -446,6 +486,11 @@ install_policy_routes() {
     # reference pattern with the Table=auto main-table hijack made explicit.
     # Pin the endpoint FIRST: handshake/keepalive must not loop into wg0.
     pin_wg_endpoint_route
+
+    # Failover before traffic is steered into the tunnel: a handshake that
+    # never completes would otherwise serve a dead lane (the mux sees only
+    # timeouts) until keep-cold restarts it.
+    is_truthy "${HANDSHAKE_FAILOVER:-1}" && ensure_handshake
 
     # Move the main-table default(s) onto the tunnel. Fail closed: without the
     # v4 default on wg0 the container keeps egressing from its host IP while

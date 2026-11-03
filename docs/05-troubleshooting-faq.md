@@ -54,6 +54,12 @@ real egress for exactly this reason.
 registration), then prints `RECOVERED` or `FAILED`. `FAILED` means that
 lane's `wg0.conf`/endpoint is bad — the pool itself is fine, the mux skips it.
 
+`warp-lite/entrypoint.sh` also walks a small endpoint ladder before declaring
+the lane up (`ensure_handshake`): if the endpoint baked into the compose env
+does not answer within `HANDSHAKE_WAIT_S` (default 12 s), it retries
+alternates with the same keys and re-pins the host route for each — no extra
+Cloudflare registrations. `HANDSHAKE_FAILOVER=0` disables it.
+
 **Host port already in use.** If `docker compose up` fails binding `310N`
 or `10800+N` (a local service already claims it — `:3102` or `:10802`
 collisions are the classic case), pick a free range and edit the `ports:` lines in
