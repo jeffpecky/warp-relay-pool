@@ -18,7 +18,9 @@
     "test": "node --test test/*.test.mjs && bash logwatch.test.sh"
   },
   "dependencies": {
-    "undici": "^7.30.1",
-    "wreq-js": "*"
+    "undici": "^7.30.1"
+  },
+  "devDependencies": {
+    "wreq-js": "^3.2.0"
   }
 }

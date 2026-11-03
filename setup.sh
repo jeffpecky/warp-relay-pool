@@ -635,7 +635,10 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
     # probe verdict on any other TLS identity would be a lie, so missing wreq-js
     # makes keep-cold exit fatally rather than probe with degraded semantics.
     CURRENT_DIR="$(pwd)"
-    if (cd "$CURRENT_DIR" && npm install --no-audit --no-fund --loglevel=error >/dev/null 2>&1); then
+    # --include=dev: wreq-js is a devDependency (the relay image must not carry
+    # it), but the host prober imports it, so a NODE_ENV=production host would
+    # otherwise install nothing and keep-cold would exit fatally.
+    if (cd "$CURRENT_DIR" && npm install --include=dev --no-audit --no-fund --loglevel=error >/dev/null 2>&1); then
       log_info "keep-cold dependencies (wreq-js probe transport) installed."
     else
       log_warn "npm install failed - install wreq-js manually (cd ${CURRENT_DIR} && npm install); without it keep-cold refuses to probe (fatal, not fallback)."
