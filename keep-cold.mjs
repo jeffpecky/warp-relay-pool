@@ -153,7 +153,7 @@
  *   inline any more; those knobs only guarded the old retry loop.
  */
 import { execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -328,7 +328,7 @@ if (!["auto", "legacy", "wreq"].includes(PROBE_TRANSPORT)) {
  * deterministic). Declared up here because model discovery runs at module
  * load, before the fingerprint block below. Minimal mode still sends
  * keep-cold/1.0. */
-const OPENCODE_PROBE_UA = "opencode/1.19.4";
+const OPENCODE_PROBE_UA = "opencode/latest/2.1.4/cli";
 
 const POPULAR_MODEL_PATTERNS = [
  /deepseek.*free/i,
@@ -497,17 +497,15 @@ function shortReason(e) {
 }
 
 // ── Upstream fingerprint ────────────────────────────────────────────
-// Historically OpenCode's free tier rejected requests that did not look like
-// the official client, so the probe carried the same headers and tool
-// declarations the proxy sends — a 403 would have hidden the 429 we are
-// looking for. Since 2026-10-14 that tier refuses every non-OpenCode client
-// regardless of shape (403 FreeTierError), so the defaults target the Kilo
-// lane, where these headers are ignored but harmless; the fingerprint is
-// kept for pools still pointed at opencode.ai via PROBE_TARGET.
+// The opencode.ai free tier refuses requests that do not look like the
+// official CLI: it compares the user-agent, the `read`/`shell` tool
+// definitions byte-for-byte, and requires the `<env>` system block. These
+// values mirror 9router's opencode executor (the only client known to pass),
+// so a probe 429 means throttling rather than a rejected shape.
 const OPENCODE_CLIENT = "cli";
-const OPENCODE_PROJECT = createHash("sha1")
- .update("git-remote:github.com/anomalyco/opencode")
- .digest("hex");
+// 9router sends the literal "global" unless the downstream client supplies a
+// project hash; upstream accepts both. Keep the same constant it uses.
+const OPENCODE_PROJECT = "global";
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 /** `ses_` + 12 hex + 14 alphanumeric, the shape the upstream gate validates. */
@@ -519,18 +517,59 @@ function sessionId() {
  return `ses_${hex}${rest}`;
 }
 
+// Verbatim from the OpenCode CLI (9router's opencodeFingerprint.js). Upstream
+// compares description and parameters byte-for-byte for these two names, and
+// a request without them is refused with 429 regardless of quota. Do not
+// reword or reformat. Other tool names are not gated.
+const FINGERPRINT_TOOL_DEFINITIONS = {
+ read: {
+  description: "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.",
+  parameters: {
+   type: "object",
+   properties: {
+    path: { type: "string", description: "File or directory to read" },
+    offset: { type: "integer", minimum: 0, description: "The line or directory entry to start reading from (1-based)" },
+    limit: { type: "integer", minimum: 0, description: "The maximum number of lines or directory entries to read (defaults to and capped at 2000)" },
+   },
+   required: ["path"],
+   additionalProperties: false,
+  },
+ },
+ shell: {
+  description: "Execute a shell command and return its output. Commands run on Linux using bash. Quote file paths containing spaces or special characters. Prefer dedicated tools over shell commands when possible. When output is large, the full result is saved to a file and a truncated preview is returned. Rely on automatic truncation unless filtering the output is more useful. Commands accept an optional timeout, background commands have no timeout by default. Background commands return immediately, and you will be notified when they complete.",
+  parameters: {
+   type: "object",
+   properties: {
+    command: { type: "string", description: "Shell command string to execute" },
+    workdir: { type: "string", description: "Working directory to execute the command in. Defaults to the current working directory. When possible, avoid changing directories in the command and set the working directory here instead." },
+    timeout: { type: "integer", minimum: 0, description: "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default." },
+    background: { type: "boolean", description: "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion." },
+   },
+   required: ["command"],
+   additionalProperties: false,
+  },
+ },
+};
+// Real OpenCode CLI tool names; read/shell carry the gate-checked definitions.
 const FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read", "edit", "write"];
+/** Definition for a declared tool: the verbatim one where upstream checks it,
+ * a stub otherwise (only read/shell are compared). */
+function fingerprintTool(name) {
+ return FINGERPRINT_TOOL_DEFINITIONS[name] ?? {
+  description: `${name} (probe)`,
+  parameters: { type: "object", properties: {} },
+ };
+}
 // Chat Completions placeholder shape: { type, function: { name, ... } }.
 const PLACEHOLDER_TOOLS = FINGERPRINT_TOOLS.map((name) => ({
  type: "function",
- function: { name, description: `${name} (probe)`, parameters: { type: "object", properties: {} } },
+ function: { name, ...fingerprintTool(name) },
 }));
 // Responses placeholder shape: flat { type, name, ... }.
 const RESPONSE_PLACEHOLDER_TOOLS = FINGERPRINT_TOOLS.map((name) => ({
  type: "function",
  name,
- description: `${name} (probe)`,
- parameters: { type: "object", properties: {} },
+ ...fingerprintTool(name),
 }));
 
 /** Redacted fingerprint descriptor for 429 logs: mode + tool count + auth + sid prefix. Never logs the full session id or Bearer value. */
@@ -996,7 +1035,12 @@ async function probe(index, model) {
         body,
         signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       });
-      return probeResponse(index, model, res, t0, fp, { transport: "wreq" });
+      const verdict = await probeResponse(index, model, res, t0, fp, { transport: "wreq" });
+      // Upstream's quota follows the TLS flow, so a reused session keeps
+      // answering 429 after the egress rotates. Drop it and let the next
+      // attempt build a fresh flow (same reset 9router does on 429).
+      if (res.status === 429) closeWreqSession(index);
+      return verdict;
     } catch (e) {
       // One dead probe must not poison the lane verdict with transport errors
       // forever: report status 0 (same shape as a legacy transport failure).

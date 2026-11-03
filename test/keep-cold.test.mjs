@@ -893,7 +893,7 @@ test("PROBE_FINGERPRINT=minimal strips fingerprint headers but keeps relay heade
   const legacy = await runOnce(sc, { TARGET_MODEL: "model-a" }, ["--probe"]);
   assert.equal(legacy.code, 0, legacy.stdout + legacy.stderr);
   const legacyReq = JSON.parse(fs.readFileSync(logPath, "utf8").trim().split("\n").at(-1));
-  assert.equal(legacyReq.ua, "opencode/1.19.4");
+  assert.equal(legacyReq.ua, "opencode/latest/2.1.4/cli");
   assert.equal(legacyReq.ocClient, "cli");
   assert.equal(legacyReq.auth, "Bearer public");
   assert.match(legacyReq.session, /^ses_/);
