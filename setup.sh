@@ -546,6 +546,44 @@ $DOCKER_COMPOSE up -d --remove-orphans
 # -------------------------------------------------------------
 # 5. Wait for Readiness and Public URLs
 # -------------------------------------------------------------
+# Health only proves a handshake exists; it does not prove the tunnel
+# forwards. A lane with a stale wg0.conf sits at handshake=0 and answers
+# nothing, which used to be reported as "SETUP COMPLETE" while clients
+# timed out. Verify each lane against Cloudflare's trace and re-register a
+# lane that has no handshake at all — exactly once, since every re-registration
+# spends one Cloudflare registration and must never loop.
+verify_lanes() {
+  failed=""
+  i=1
+  while [ "$i" -le "$COUNT" ]; do
+    lane="warp-relay-warp-${i}"
+    trace="$(docker exec "$lane" curl -s -m 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    if printf '%s\n' "$trace" | grep -qx 'warp=on'; then
+      log_ok "lane ${i}: OK"
+    elif [ -n "$(docker exec "$lane" wg show wg0 latest-handshakes 2>/dev/null | awk 'NR==1 && $2+0 > 0 {print $2}')" ]; then
+      # A handshake means the profile is valid; a failed trace is transient
+      # (endpoint congestion) and re-registering cannot fix routing.
+      log_warn "lane ${i}: handshake ok but egress trace failed (transient)"
+    else
+      log_warn "lane ${i}: no handshake — re-registering once"
+      docker exec "$lane" rm -f /etc/wireguard/wg0.conf >/dev/null 2>&1 || true
+      docker restart "$lane" >/dev/null 2>&1 || true
+      sleep 20
+      trace="$(docker exec "$lane" curl -s -m 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+      if printf '%s\n' "$trace" | grep -qx 'warp=on'; then
+        log_ok "lane ${i}: RECOVERED"
+      else
+        log_err "lane ${i}: FAILED — inspect: docker logs --tail 40 ${lane}"
+        failed="${failed} ${i}"
+      fi
+    fi
+    i=$((i + 1))
+  done
+  if [ -n "$failed" ]; then
+    log_warn "Lanes failing verification:${failed}. The mux skips them; fix them before trusting the pool."
+  fi
+}
+
 if [ -n "$WITH_TUNNELS_FLAG" ]; then
   log_info "Waiting for TryCloudflare Quick Tunnels to mint public URLs (approx 20-30s)..."
   attempt=0
@@ -594,6 +632,8 @@ else
     log_ok "All ${COUNT} WARP tunnels handshaked."
   fi
 fi
+
+verify_lanes
 
 # -------------------------------------------------------------
 # 6. Install Keep-Cold Auto-Rotation Service (Systemd)

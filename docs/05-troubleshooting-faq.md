@@ -48,6 +48,12 @@ tunnel). One relay red = its `warp-N`; all red = relay app or host
 network. `warpReady` in `keep-cold.mjs` gates rotation on Connected +
 real egress for exactly this reason.
 
+`setup.sh` verifies every lane after the handshake wait: an in-container
+`https://cloudflare.com/cdn-cgi/trace` must print `warp=on`. A lane with
+`handshake=0` gets exactly one tier-2 re-registration (one Cloudflare
+registration), then prints `RECOVERED` or `FAILED`. `FAILED` means that
+lane's `wg0.conf`/endpoint is bad — the pool itself is fine, the mux skips it.
+
 **Host port already in use.** If `docker compose up` fails binding `310N`
 or `10800+N` (a local service already claims it — `:3102` or `:10802`
 collisions are the classic case), pick a free range and edit the `ports:` lines in
