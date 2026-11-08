@@ -580,7 +580,7 @@ verify_lanes() {
     i=$((i + 1))
   done
   if [ -n "$failed" ]; then
-    log_warn "Lanes failing verification:${failed}. The mux skips them; fix them before trusting the pool."
+    log_warn "Lanes failing verification:${failed}. The router skips them; fix them before trusting the pool."
   fi
 }
 
@@ -742,29 +742,26 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
 fi
 
 # -------------------------------------------------------------
-# 7. Final Output for pi-freeflow
+# 7. Final output — the one relay URL
 # -------------------------------------------------------------
 echo ""
 sh ./get-status.sh "$COUNT"
 
 echo ""
 echo "======================================================================="
-printf "${GREEN}${BOLD}✅ SETUP COMPLETE!${RESET}\n"
+printf "%s\n" "${GREEN}${BOLD}SETUP COMPLETE${RESET}"
 echo "======================================================================="
-echo "📋 Copy the '/freeflow add' commands printed above and paste them"
-echo "   directly into your OMP or Pi coding agent chat."
+echo "Dial the single relay URL printed above. It fronts all ${COUNT} relays:"
+echo "every request is routed to a lane, and a throttled or dead lane is"
+echo "skipped without the client noticing."
 echo ""
-echo "🚀 Next steps in your agent chat:"
-echo "   /freeflow status   -> verify pool health"
-echo "   /freeflow list     -> show saved relays"
-echo "   /freeflow test     -> run an upstream inference test across all relays"
-echo "   /freeflow spread   -> fan parallel subagents across all relays"
+echo "Health check (returns the egress IP of whichever lane answered):"
+echo "  curl -s -x <relay-url> https://cloudflare.com/cdn-cgi/trace"
 echo ""
-echo "   Modes: /freeflow auto (= sticky, default) | /freeflow on | /freeflow spread | /freeflow off"
-echo ""
-echo "🔄 Rate-Limit Protection:"
-echo "   Every ${SWEEP_INTERVAL_MIN} minutes keep-cold sweeps all ${COUNT} relays. Any relay"
-echo "   answering HTTP 429 is restarted onto a fresh egress /64 and re-probed"
-echo "   until it streams again. Your public tunnel URLs never change!"
+echo "Rotation: warp-keep-cold.timer sweeps all ${COUNT} relays every"
+echo "   ${SWEEP_INTERVAL_MIN} minutes, and warp-keep-cold-signals.timer consumes"
+echo "   429 signals every minute so a freshly throttled egress is rotated"
+echo "   long before the next sweep. A rotated relay gets a new egress and"
+echo "   rejoins the pool automatically."
 echo "======================================================================="
 echo ""
