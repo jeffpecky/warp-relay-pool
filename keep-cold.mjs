@@ -667,9 +667,12 @@ function buildProbe(model) {
 /** Legacy headers for legacy, env-only and timestamp-only alike: the matrix
  * varies the body only, so header bytes stay comparable across modes. Only
  * minimal strips down to relay-only headers. */
-function probeHeaders(relayPath, sidOverride) {
+function probeHeaders(relayPath, sidOverride, index) {
   const isOpenCode = PROBE_TARGET.includes("opencode.ai");
   const sid = sidOverride ?? sessionId();
+  // One relay port now serves the whole pool, so the lane has to travel as a
+  // header. Honored only alongside x-keep-cold-probe, which every probe sends.
+  const lane = index === undefined ? {} : { "x-relay-lane": String(index) };
   if (PROBE_FINGERPRINT === "minimal") {
     return {
       "content-type": "application/json",
@@ -682,6 +685,7 @@ function probeHeaders(relayPath, sidOverride) {
       // turn a probe's 429 into a "live traffic" signal (it would feed the next
       // pass a throttle the probe itself just created). Stripped before upstream.
       "x-keep-cold-probe": "1",
+      ...lane,
       accept: "text/event-stream",
     };
   }
@@ -699,6 +703,7 @@ function probeHeaders(relayPath, sidOverride) {
     // turn a probe's 429 into a "live traffic" signal (it would feed the next
     // pass a throttle the probe itself just created). Stripped before upstream.
     "x-keep-cold-probe": "1",
+    ...lane,
     accept: "text/event-stream",
   };
   if (isOpenCode) {
@@ -1002,14 +1007,17 @@ async function wreqSession(index, wreq) {
   if (entry) return entry;
   // Direct lane ingress speaks the same Basic Proxy-Authorization as the
   // relay-wide router; empty RELAY_PROXY_AUTH means a mesh install without
-  // credentials (the probe then rides the unauthenticated lane shape).
-  const authority = RELAY_PROXY_AUTH ? `${RELAY_PROXY_AUTH}@` : "";
+  // credentials (the probe then rides the unauthenticated lane shape). The
+  // user carries the lane: `lane-N`, and the configured password when auth is
+  // on — that pair is what the relay accepts as a pin.
+  const pass = RELAY_PROXY_AUTH.includes(":") ? RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1) : "";
+  const user = `lane-${index}${pass ? `:${pass}` : ""}`;
   // PROBE_DIRECT=1 drops the lane proxy so the same request rides this host's
   // own egress. Diagnostic only: distinguishes "every WARP egress is throttled"
   // from "the probe shape is still wrong".
   const proxy = process.env.PROBE_DIRECT === "1"
     ? null
-    : `http://${authority}${RELAY_HOST}:${BASE_PORT + index}`;
+    : `http://${user}@${RELAY_HOST}:${BASE_PORT}`;
   entry = wreq.createSession({
     emulation: { tlsOptions: { ...WREQ_TLS_PROFILE, alpnProtocols: [...WREQ_TLS_PROFILE.alpnProtocols] } },
     ...(proxy ? { proxy } : {}),
@@ -1040,10 +1048,12 @@ async function probe(index, model) {
     try {
       const session = await wreqSession(index, transport.wreq);
       const target = new URL(relayPath, PROBE_TARGET);
-      const headers = probeHeaders(relayPath, sid);
+      const headers = probeHeaders(relayPath, sid, index);
       delete headers["x-relay-target"];
       delete headers["x-relay-path"];
       delete headers["x-keep-cold-probe"];
+      // The session's proxy userinfo already carries the lane.
+      delete headers["x-relay-lane"];
       const res = await session.fetch(target, {
         method: "POST",
         headers,
@@ -1063,12 +1073,12 @@ async function probe(index, model) {
     }
   }
 
-  const url = `http://${RELAY_HOST}:${BASE_PORT + index}`;
+  const url = `http://${RELAY_HOST}:${BASE_PORT}`;
   try {
     const res = await fetch(url, {
       method: "POST",
       headers: {
-        ...probeHeaders(relayPath, sid),
+        ...probeHeaders(relayPath, sid, index),
         ...(RELAY_PROXY_AUTH
           ? { "proxy-authorization": `Basic ${Buffer.from(RELAY_PROXY_AUTH).toString("base64")}` }
           : {}),
@@ -1505,7 +1515,7 @@ async function restartUnhealthyRelays(state) {
 async function sweep() {
  const state = loadState();
  const models = PROBE_MODELS;
- log(`full sweep: ${COUNT} relay(s) x ${models.length} model(s) via ${RELAY_HOST}:${BASE_PORT + 1}..${BASE_PORT + COUNT}`);
+ log(`full sweep: ${COUNT} relay(s) x ${models.length} model(s) via ${RELAY_HOST}:${BASE_PORT} (lane header)`);
 
  const restartedUnhealthy = await restartUnhealthyRelays(state);
  if (restartedUnhealthy.length) {
@@ -2176,7 +2186,7 @@ async function pass() {
 
  const { selected, audit } = selectSuspects(state, { baseline, excluded: new Set(signalHot.keys()) });
  const suspects = [...selected].sort((a, b) => a - b);
- log(`probing ${suspects.length} of ${COUNT} relay(s) x ${PROBE_MODELS.length} model(s) via ${RELAY_HOST}:${BASE_PORT + 1}..${BASE_PORT + COUNT}${baseline ? " (baseline)" : ""}`);
+ log(`probing ${suspects.length} of ${COUNT} relay(s) x ${PROBE_MODELS.length} model(s) via ${RELAY_HOST}:${BASE_PORT} (lane header)${baseline ? " (baseline)" : ""}`);
  if (audit.length) log(`audit sample: ${audit.map((i) => `#${i}`).join(" ")}`);
 
  const probed = new Map();

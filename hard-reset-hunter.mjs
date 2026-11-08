@@ -4,6 +4,8 @@ import { randomBytes, createHash } from 'node:crypto';
 
 const execAsync = promisify(execFile);
 const COUNT = parseInt(process.env.COUNT || '10', 10);
+const RELAY_HOST = process.env.RELAY_HOST || '10.244.0.100';
+const BASE_PORT = parseInt(process.env.BASE_PORT || '3000', 10);
 const TARGET_MODEL = process.env.TARGET_MODEL || 'deepseek-v4.1-flash-free';
 const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '25', 10);
 
@@ -12,7 +14,7 @@ const tools = ['bash', 'glob', 'grep', 'read', 'edit', 'write'].map((name) => ({
   function: { name, description: `${name} (probe)`, parameters: { type: 'object', properties: {} } },
 }));
 
-function getProbeHeaders(sid, prj) {
+function getProbeHeaders(sid, prj, index) {
   return {
     'content-type': 'application/json',
     'user-agent': 'opencode/1.18.31',
@@ -27,17 +29,18 @@ function getProbeHeaders(sid, prj) {
     'x-relay-target': 'https://opencode.ai',
     'x-relay-path': '/inference/v1/chat/completions',
     'x-keep-cold-probe': '1',
+    // One port serves the whole pool, so the lane travels as a header.
+    'x-relay-lane': String(index),
   };
 }
 
 async function probeRelay(index) {
   const sid = `ses_${randomBytes(6).toString('hex')}${randomBytes(14).toString('base64url').slice(0, 14)}`;
   const prj = createHash('sha1').update('git-remote:github.com/anomalyco/opencode').digest('hex');
-  const headers = getProbeHeaders(sid, prj);
-  const port = 3000 + index;
+  const headers = getProbeHeaders(sid, prj, index);
 
   try {
-    const res = await fetch(`http://10.244.0.100:${port}/inference/v1/chat/completions`, {
+    const res = await fetch(`http://${RELAY_HOST}:${BASE_PORT}/inference/v1/chat/completions`, {
       method: 'POST',
       headers,
       body: JSON.stringify({

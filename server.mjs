@@ -54,19 +54,29 @@ function secretEquals(given, expected) {
 
 // Parse the relay's own Basic gate once: the connect path and the request path
 // both need the decoded credentials, not just a yes/no.
+//
+// Two accepted shapes: the exact configured "user:pass", and "lane-N:pass"
+// with the same password half. The second exists so keep-cold — which must
+// name the lane it measures — can pin through the proxy userinfo; it is not a
+// weaker gate, because the password half must still match exactly, and a
+// caller who has it could already send the exact shape anyway.
 function proxyAuthInfo(req) {
   if (!RELAY_PROXY_AUTH) return { ok: true, user: null, pass: null };
   const header = String(req.headers["proxy-authorization"] || "");
   const space = header.indexOf(" ");
   if (!/^basic$/i.test(header.slice(0, space).trim())) return { ok: false, user: null, pass: null };
   const decoded = Buffer.from(header.slice(space + 1), "base64").toString("utf8");
-  if (!secretEquals(decoded, RELAY_PROXY_AUTH)) return { ok: false, user: null, pass: null };
   const colon = decoded.indexOf(":");
-  return {
-    ok: true,
-    user: colon < 0 ? decoded : decoded.slice(0, colon),
-    pass: colon < 0 ? "" : decoded.slice(colon + 1),
-  };
+  const user = colon < 0 ? decoded : decoded.slice(0, colon);
+  const pass = colon < 0 ? "" : decoded.slice(colon + 1);
+  const wantPass = RELAY_PROXY_AUTH.includes(":")
+    ? RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1)
+    : "";
+  const laneForm = /^lane-\d+$/.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
+  if (!laneForm && !secretEquals(decoded, RELAY_PROXY_AUTH)) {
+    return { ok: false, user: null, pass: null };
+  }
+  return { ok: true, user, pass };
 }
 
 // A missing or non-numeric knob takes the documented default; so does an

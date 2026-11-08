@@ -24,8 +24,9 @@ const PORT_MIN = 25000;
 const PORT_MAX = 26999;
 const PORT_BLOCK = 32;
 // Behaviour scenarios that bind relays: keep this in step with the tests below
-// so the random start always leaves room for every block.
-const SCENARIO_BLOCKS = 45;
+// so the random start always leaves room for every block. One listener now
+// serves the whole pool, so a scenario takes one block regardless of COUNT.
+const SCENARIO_BLOCKS = 52;
 let nextBlock = PORT_MIN
  + Math.floor(Math.random() * Math.max(1, PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
 
@@ -106,12 +107,19 @@ if (args[0] === "restart") {
  };
 }
 
-function startRelay(port, logFile, throttle) {
+// One listener serves the whole pool now, so the fake relay dispatches on the
+// lane header and keeps one log per lane — every existing assertion still reads
+// `relay-<i>.log`, it just comes from a single port.
+function startRelay(port, logs, throttles, dead) {
  return new Promise((resolve, reject) => {
   const srv = http.createServer((req, res) => {
    let body = "";
    req.on("data", (d) => (body += d));
    req.on("end", () => {
+    // A request that names no lane (or an unknown one) still has to land
+    // somewhere for the harness to observe it; lane 1 is the catch-all.
+    const lane = Number(req.headers["x-relay-lane"]) || 1;
+    const logFile = logs.get(lane) ?? logs.get(1);
     let model = "";
     let tools = -1;
     let sys = "";
@@ -128,7 +136,12 @@ function startRelay(port, logFile, throttle) {
       model = "";
     }
     fs.appendFileSync(logFile, `${JSON.stringify({ model, ua: req.headers["user-agent"] ?? "", ocClient: req.headers["x-opencode-client"] ?? "", auth: req.headers["authorization"] ?? "", relayTarget: req.headers["x-relay-target"] ?? "", relayPath: req.headers["x-relay-path"] ?? "", keepCold: req.headers["x-keep-cold-probe"] ?? "", session: req.headers["x-opencode-session"] ?? "", tools, sys })}\n`);
-    const rawSpec = throttle.get(model);
+    // A "dead" lane fails its connection: the probe must report status 0.
+    if (dead.includes(lane)) {
+      req.socket.destroy();
+      return;
+    }
+    const rawSpec = throttles.get(lane)?.get(model);
     const spec = typeof rawSpec === "function" ? rawSpec() : rawSpec;
     if (spec) {
      const headers = { "content-type": "application/json" };
@@ -148,11 +161,10 @@ function startRelay(port, logFile, throttle) {
 
 async function startRelays(sc, { dead = [] } = {}) {
  if (sc.basePort === null) sc.basePort = takeBlock();
- for (let i = 1; i <= sc.count; i++) {
-  if (dead.includes(i)) continue;
-  const srv = await startRelay(sc.basePort + i, path.join(sc.dir, `relay-${i}.log`), sc.throttles.get(i));
-  servers.push(srv);
- }
+ const logs = new Map();
+ for (let i = 1; i <= sc.count; i++) logs.set(i, path.join(sc.dir, `relay-${i}.log`));
+ const srv = await startRelay(sc.basePort, logs, sc.throttles, dead);
+ servers.push(srv);
 }
 
 function baseEnv(sc) {
