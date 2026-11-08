@@ -75,16 +75,19 @@ function proxyCredOk(req) {
 
 // A missing or non-numeric knob takes the documented default; so does an
 // out-of-range one, except where 0 is meaningful (0 retries, no probes).
-function laneEnv(name, fallback, { min = 1, allowZero = false } = {}) {
+// `passthrough` hands the raw value to the callee's own validation instead:
+// createLanes must see a bad stickyMax so a typo stops the container.
+function laneEnv(name, fallback, { allowZero = false, passthrough = false } = {}) {
   const n = parseInt(process.env[name] ?? "", 10);
   if (!Number.isFinite(n)) return fallback;
-  if (n === 0 && allowZero) return 0;
-  return n < min ? fallback : n;
+  if (passthrough) return n;
+  if (allowZero) return n <= 0 ? 0 : n;
+  return n < 1 ? fallback : n;
 }
 
 const RETRY_MAX = laneEnv("RELAY_LANE_RETRY_MAX", 3, { allowZero: true });
 const RETRY_MAX_BODY = laneEnv("RELAY_LANE_RETRY_MAX_BODY", 1048576);
-const STICKY_MAX = laneEnv("RELAY_LANE_STICKY_MAX", 10000);
+const STICKY_MAX = laneEnv("RELAY_LANE_STICKY_MAX", 10000, { passthrough: true });
 const LANE_PROBE_MS = laneEnv("RELAY_LANE_PROBE_S", 30, { allowZero: true }) * 1000;
 const LANE_COOLDOWN_MS = laneEnv("RELAY_LANE_COOLDOWN_S", 240) * 1000;
 const LANE_COOLDOWN_429_MS = laneEnv("RELAY_LANE_429_S", 120) * 1000;
@@ -380,11 +383,13 @@ const server = http.createServer(async (req, res) => {
   // Direct health check: only when NO x-relay-target header is passed
   // (and the request line is not absolute-form). Exempt from the token gate.
   if (!target) {
-    const lane = lanes.pick(key);
-    if (!lane) {
-      res.writeHead(503, { "content-type": "application/json", "retry-after": "30" });
-      return res.end(JSON.stringify({ error: "No relay available" }));
-    }
+    // Fall back to the first lane when the pool is exhausted. A diagnostic
+    // endpoint that 503s when every lane is cooled would make every probe
+    // fail, which marks every lane sick — and a sick lane is only cleared by
+    // a probe that needs a usable lane. Answering here is what lets a cooled
+    // or sick fleet recover. (Task 7 makes this honor x-relay-lane, so each
+    // lane's probe reaches that lane.)
+    const lane = lanes.pick(key) || lanes.lanes[0];
     try {
       const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
         dispatcher: lane.agent,
@@ -396,8 +401,13 @@ const server = http.createServer(async (req, res) => {
       return res.end(`Relay #${lane.n} OK (via socks5://${lane.host}:${lane.port})\n\n${text}`);
     } catch (err) {
       // Detail stays in the logs: the body used to reflect String(err).
+      // Deliberately does NOT cool the lane: keep-cold's probe factory dials
+      // this path with no session header, so every probe would share one
+      // sticky key. Cooling here would let one bad trace fetch park the lane
+      // whose probe then reports it sick — and a sick lane is only cleared by
+      // a probe that needs a usable lane. That deadlock is fleet-wide and
+      // permanent. Lane health is owned by the probe path in router.mjs.
       console.error(`[relay #${lane.n}] health check failed: ${err?.stack ?? String(err)}`);
-      lanes.cool(lane, LANE_COOLDOWN_MS, "health check failed");
       res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
       return res.end(`Relay #${lane.n} health check failed\n`);
     }
@@ -460,10 +470,19 @@ const server = http.createServer(async (req, res) => {
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
   const isProbe = req.headers[HEADER_PROBE] !== undefined;
   const sniffEnabled = Boolean(signalWriter) && hasBody && !isProbe;
-  const { replayable, body: reqBody } = await readReplayableBody(req, RETRY_MAX_BODY);
+  let replayable;
+  let reqBody;
+  try {
+    ({ replayable, body: reqBody } = await readReplayableBody(req, RETRY_MAX_BODY));
+  } catch (err) {
+    // The client vanished mid-body: nothing to answer and no lane to blame.
+    console.error(`[relay] request body aborted: ${err?.message ?? String(err)}`);
+    if (!res.headersSent) res.destroy();
+    return;
+  }
   const sniffer = sniffEnabled && reqBody && !Buffer.isBuffer(reqBody) ? createModelSniffer() : null;
 
-  // One tee per process; a buffered body is sniffed directly instead.
+  // A buffered body is sniffed directly; a streamed one is teed once.
   const modelOf = () => {
     if (!sniffEnabled) return "unknown";
     if (Buffer.isBuffer(reqBody)) {
@@ -506,6 +525,9 @@ const server = http.createServer(async (req, res) => {
         });
       } catch (err) {
         failure = err;
+        // A client abort is not the lane's fault: it would evict a healthy
+        // lane and then retry a request whose client is already gone.
+        if (controller.signal.aborted) break;
         lanes.cool(lane, LANE_COOLDOWN_MS, "lane connect failed");
       }
 
