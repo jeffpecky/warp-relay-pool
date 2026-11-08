@@ -7,7 +7,6 @@
 // - usable() = !sick && now >= probeOutUntil && now >= cool429Until.
 // - pick() returns null when nothing is usable; the caller owns the 503.
 import http from "node:http";
-import { Agent } from "undici";
 
 export function laneKey(headers = {}, peerAddress = "") {
   const h = headers || {};
@@ -16,10 +15,6 @@ export function laneKey(headers = {}, peerAddress = "") {
     if (typeof v === "string" && v.trim()) return v.trim();
   }
   return String(peerAddress || "").trim() || "unknown";
-}
-
-function defaultAgentFor() {
-  return new Agent();
 }
 
 // Real health path: the same GET / a client's lane would answer.
@@ -47,15 +42,21 @@ function defaultProbeFactory() {
 
 export function createLanes({
   count,
-  agentFor = defaultAgentFor,
+  agentFor,
   probe = defaultProbeFactory(),
   probeIntervalMs = 30_000,
   cooldownMs = 240_000,
   cooldown429Ms = 120_000,
-  stickyMax = 4096,
+  stickyMax = 10_000,
   log = (msg) => console.log(`[router] ${msg}`),
 } = {}) {
   if (!Number.isInteger(count) || count < 1) throw new Error("createLanes: count required");
+  if (typeof agentFor !== "function") throw new Error("createLanes: agentFor required");
+  if (!Number.isInteger(stickyMax) || stickyMax < 1) {
+    // A non-positive cap would hang the eviction loop or silently disable
+    // affinity; reject the typo at construction instead.
+    throw new Error("createLanes: stickyMax must be a positive integer");
+  }
 
   const lanes = Array.from({ length: count }, (_, i) => {
     const n = i + 1;
@@ -100,7 +101,6 @@ export function createLanes({
       bindSticky(key, held);
       return held;
     }
-    if (key) sticky.delete(key);
     for (let i = 0; i < count; i++) {
       rr = (rr % count) + 1;
       const lane = byN.get(rr);
@@ -159,7 +159,6 @@ export function createLanes({
       clearInterval(t);
       clearTimeout(t);
     }
-    for (const lane of lanes) lane.agent?.close?.();
   }
 
   return {

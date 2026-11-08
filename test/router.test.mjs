@@ -49,6 +49,14 @@ test("laneKey prefers session headers over credentials", () => {
   assert.equal(laneKey({ "x-session-id": "s3" }, "1.2.3.4"), "s3");
 });
 
+test("laneKey orders the session headers opencode > affinity > id", () => {
+  assert.equal(
+    laneKey({ "x-session-id": "s3", "x-session-affinity": "s2", "x-opencode-session": "s1" }, "1.2.3.4"),
+    "s1"
+  );
+  assert.equal(laneKey({ "x-session-id": "s3", "x-session-affinity": "s2" }, "1.2.3.4"), "s2");
+});
+
 test("laneKey falls back to the peer address, then a constant", () => {
   assert.equal(laneKey({ authorization: "Bearer public" }, "1.2.3.4"), "1.2.3.4");
   assert.equal(laneKey({}, ""), "unknown");
@@ -57,8 +65,54 @@ test("laneKey falls back to the peer address, then a constant", () => {
 test("sticky LRU evicts beyond stickyMax, and the evicted key re-picks", () => {
   const p = pool(2, { stickyMax: 2 });
   const a = p.pick("a");
+  assert.equal(a.n, 1);
   p.pick("b");
   p.pick("c");
   assert.equal(p.stickySize(), 2);
   assert.ok(p.pick("a"), "an evicted key still gets a lane");
+});
+
+test("sticky LRU refreshes on hit, so the least-recently-used key is evicted", () => {
+  const p = pool(3, { stickyMax: 2 });
+  assert.equal(p.pick("a").n, 1);
+  assert.equal(p.pick("b").n, 2);
+  assert.equal(p.pick("a").n, 1, "hit keeps its lane");
+  assert.equal(p.pick("c").n, 3);
+  assert.equal(p.stickySize(), 2);
+  // "b" was least recently used, so it was evicted; a fresh pick continues
+  // round-robin to lane 1. A retained "b" would answer with lane 2.
+  assert.equal(p.pick("b").n, 1);
+});
+
+test("a failing probe marks the lane sick and parks it", async () => {
+  const p = pool(1, { probe: async () => false, probeIntervalMs: 5 });
+  p.start();
+  try {
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(p.lanes[0].sick, true);
+    assert.ok(p.lanes[0].probeOutUntil > Date.now());
+    assert.equal(p.pick("k"), null);
+  } finally {
+    p.stop();
+  }
+});
+
+test("a passing probe clears only its own lane", async () => {
+  const p = pool(2, { probe: async (l) => l.n === 1, probeIntervalMs: 5 });
+  p.lanes[0].cool429Until = Date.now() + 60_000;
+  p.start();
+  try {
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(p.lanes[0].sick, false);
+    assert.equal(p.lanes[0].probeOutUntil, 0);
+    assert.ok(p.lanes[0].cool429Until > Date.now() + 50_000, "the 429 lane survives a passing probe");
+  } finally {
+    p.stop();
+  }
+});
+
+test("construction rejects a non-positive stickyMax and a missing agentFor", () => {
+  assert.throws(() => createLanes({ count: 1, agentFor: (n) => ({ n }), stickyMax: -1 }), /stickyMax/);
+  assert.throws(() => createLanes({ count: 1, agentFor: (n) => ({ n }), stickyMax: 0 }), /stickyMax/);
+  assert.throws(() => createLanes({ count: 1 }), /agentFor/);
 });
