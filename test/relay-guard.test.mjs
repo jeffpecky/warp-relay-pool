@@ -24,7 +24,7 @@ const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 // Disjoint from keep-cold.test.mjs (25000-25999) so parallel test files cannot
 // bind each other's relay port.
 const BASE_PORT = 23000 + Math.floor(Math.random() * 1000);
-const RELAY_PORT = BASE_PORT + 1;
+const RELAY_PORT = BASE_PORT;
 
 let sink;
 let child;
@@ -124,7 +124,7 @@ function startUpstream(handler) {
 function hitSecond(relayPath, opts = {}) {
   const headers = { "x-relay-target": opts.target ?? `http://127.0.0.1:${upstream.address().port}` };
   if (relayPath !== undefined) headers["x-relay-path"] = relayPath;
-  return fetch(`http://127.0.0.1:${BASE_PORT2 + 1}${opts.urlPath ?? "/v1/models"}`, {
+  return fetch(`http://127.0.0.1:${BASE_PORT2}${opts.urlPath ?? "/v1/models"}`, {
     method: opts.method ?? "GET",
     headers,
     body: opts.body,
@@ -202,9 +202,11 @@ before(async () => {
       BASE_PORT: String(BASE_PORT),
       WARP_HOST_1: "127.0.0.1",
       WARP_PORT_1: String(sinkPort),
-      // Mux out of scope: its health probe walks the real egress path and
-      // would pollute dispatch counts.
-      RELAY_MUX: "0",
+      // No probes: probe traffic would pollute dispatch counts.
+      RELAY_LANE_PROBE_S: "0",
+      // Every dispatch through the fake sink fails by design, so a retry
+      // would only multiply the CONNECT records these tests count.
+      RELAY_LANE_RETRY_MAX: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -257,8 +259,11 @@ before(async () => {
       RELAY_ALLOWED_TARGETS: `http://127.0.0.1:${upstream.address().port}`,
       LIVE_SIGNALS: "1",
       LIVE_SIGNAL_FILE: signalFile,
-      // Mux out of scope: health-probe traffic would pollute record counts.
-      RELAY_MUX: "0",
+      // No probes: probe traffic would pollute dispatch counts.
+      RELAY_LANE_PROBE_S: "0",
+      // Every dispatch through the fake sink fails by design, so a retry
+      // would only multiply the CONNECT records these tests count.
+      RELAY_LANE_RETRY_MAX: "0",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -348,7 +353,7 @@ test("non-allowlisted target still gets 403", async () => {
 function rawRequest({ method = "POST", headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request(
-      { host: "127.0.0.1", port: BASE_PORT2 + 1, path: "/v1/models", method, headers },
+      { host: "127.0.0.1", port: BASE_PORT2, path: "/v1/models", method, headers },
       (res) => {
         let data = "";
         res.on("data", (d) => (data += d));
@@ -383,6 +388,24 @@ test("chunked upload is forwarded instead of 502", async () => {
   });
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(res.body).body, '{"stream":true}');
+});
+
+test("a POST declaring content-length is forwarded instead of 502", async () => {
+  // Every ordinary client sends content-length. Forwarding it to fetch throws
+  // UND_ERR_INVALID_ARG against a dispatcher, which turned every such upload
+  // into a 502; the header must be dropped and the length re-derived.
+  const payload = '{"model":"test/cl"}';
+  const res = await rawRequest({
+    headers: {
+      "x-relay-target": `http://127.0.0.1:${upstream.address().port}`,
+      "x-relay-path": "/v1/models",
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(payload)),
+    },
+    body: payload,
+  });
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).body, payload);
 });
 
 test("Expect: 100-continue upload is forwarded instead of 502", async () => {

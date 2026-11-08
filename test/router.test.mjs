@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { createLanes, laneKey, readReplayableBody, retryable } from "../router.mjs";
+import { createLanes, laneKey, readReplayableBody, resolvePinnedLane, retryable } from "../router.mjs";
 
 const quiet = () => {};
 function pool(count, over = {}) {
@@ -33,6 +33,22 @@ test("all lanes unusable yields null", () => {
   const p = pool(2);
   for (const l of p.lanes) p.cool(l, 60_000, "test");
   assert.equal(p.pick("x"), null);
+});
+
+test("a pool parked only by 429 cooldowns still serves", () => {
+  // A 429 is a throttle on one egress IP, not a dead lane. Parking the last
+  // usable lane would turn a throttle into a fleet-wide 503 for the whole
+  // cooldown window, so a 429-only exhaustion falls back to a lane.
+  const p = pool(2);
+  for (const l of p.lanes) p.cool(l, 60_000, "429", "signal");
+  assert.notEqual(p.pick("x"), null);
+});
+
+test("a probe-parked lane is not resurrected by the 429 fallback", () => {
+  const p = pool(1);
+  p.cool(p.lanes[0], 60_000, "429", "signal");
+  p.cool(p.lanes[0], 60_000, "probe");
+  assert.equal(p.pick("x"), null, "a broken egress must stay excluded");
 });
 
 test("the 429 lane and the probe lane decay independently", () => {
@@ -198,4 +214,49 @@ test("a connect error replays regardless of method", () => {
 });
 test("a non-replayable body is never retried", () => {
   assert.equal(retryable({ method: "POST", status: 429, replayable: false }), false);
+});
+
+// ── Pinned lanes (keep-cold only) ────────────────────────────────────
+// Targeting a lane lets a prober attribute a result to the egress that
+// produced it. It is honored ONLY for traffic that carries the probe marker
+// and, for the userinfo form, valid credentials — otherwise any client could
+// pin any egress and defeat the pool's spreading.
+
+test("x-relay-lane pins only with the probe marker", () => {
+  const lanes = pool(3).lanes;
+  assert.equal(resolvePinnedLane({ headers: { "x-relay-lane": "2", "x-keep-cold-probe": "1" }, lanes })?.n, 2);
+  assert.equal(resolvePinnedLane({ headers: { "x-relay-lane": "2" }, lanes }), null);
+});
+
+test("out-of-range and malformed lane ids are ignored", () => {
+  const lanes = pool(3).lanes;
+  for (const v of ["0", "4", "999", "abc", "-1", "", "2.5", " 2", "1e1"]) {
+    assert.equal(
+      resolvePinnedLane({ headers: { "x-relay-lane": v, "x-keep-cold-probe": "1" }, lanes }),
+      null,
+      `lane id ${JSON.stringify(v)} must not pin`,
+    );
+  }
+});
+
+test("lane-N userinfo pins only with configured credentials", () => {
+  const lanes = pool(3).lanes;
+  const base = { headers: { "x-keep-cold-probe": "1" }, proxyUser: "lane-2", lanes };
+  assert.equal(resolvePinnedLane({ ...base, proxyAuth: "u:p", proxyPass: "p" })?.n, 2);
+  assert.equal(resolvePinnedLane({ ...base, proxyAuth: "" }), null, "no RELAY_PROXY_AUTH means no pin");
+  assert.equal(resolvePinnedLane({ ...base, proxyAuth: "u:p", proxyPass: "wrong" }), null);
+  assert.equal(
+    resolvePinnedLane({ ...base, proxyAuth: "u:p" }),
+    null,
+    "a missing password is not a matching password",
+  );
+  assert.equal(resolvePinnedLane({ ...base, proxyAuth: "u:p", proxyUser: "lane-9", proxyPass: "p" }), null);
+});
+
+test("a lane id is matched in range, never as a prefix or a fraction", () => {
+  const lanes = pool(12).lanes;
+  const pin = (v) => resolvePinnedLane({ headers: { "x-relay-lane": v, "x-keep-cold-probe": "1" }, lanes })?.n ?? null;
+  assert.equal(pin("12"), 12);
+  assert.equal(pin("13"), null);
+  assert.equal(pin("01"), null);
 });

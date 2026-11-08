@@ -6,7 +6,7 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Agent } from "undici";
 import { createSignalWriter } from "./signal-writer.mjs";
-import { createLanes, laneKey, readReplayableBody, retryable } from "./router.mjs";
+import { createLanes, laneKey, readReplayableBody, resolvePinnedLane, retryable } from "./router.mjs";
 
 const COUNT = parseInt(process.env.RELAY_COUNT || "10", 10);
 // Per-process in-flight cap. Streaming responses hold sockets for minutes, and
@@ -67,10 +67,6 @@ function proxyAuthInfo(req) {
     user: colon < 0 ? decoded : decoded.slice(0, colon),
     pass: colon < 0 ? "" : decoded.slice(colon + 1),
   };
-}
-
-function proxyCredOk(req) {
-  return proxyAuthInfo(req).ok;
 }
 
 // A missing or non-numeric knob takes the documented default; so does an
@@ -288,10 +284,20 @@ const DROP_HEADERS = new Set([
   HEADER_PATH,
   HEADER_PROBE,
   HEADER_AUTH,
+  // Lane targeting is relay-internal: forwarding it would let a probed
+  // upstream see (and a log-replaying attacker copy) the routing hint.
+  "x-relay-lane",
+  "proxy-authorization",
   "connection",
   "keep-alive",
   "proxy-connection",
   "transfer-encoding",
+  // undici derives the length from the body it is given. Forwarding the
+  // client's own content-length throws UND_ERR_INVALID_ARG against a
+  // dispatcher (undici 7.30 vs the bundled 7.13 on Node 24), which failed
+  // every ordinary POST, and a length a client asserts is not the length we
+  // actually send anyway — a short body would hang the upstream waiting.
+  "content-length",
   "te",
   "trailer",
   "upgrade",
@@ -388,9 +394,15 @@ const server = http.createServer(async (req, res) => {
     // fail, which marks every lane sick — and a sick lane is only cleared by
     // a probe that needs a usable lane. Answering here is what lets a cooled
     // or sick fleet recover.
-    // Task 7 inserts the pin HERE, above the pick: a probe naming lane N must
-    // reach lane N, or a dead lane reads healthy forever.
-    const pinned = null;
+    // A probe naming lane N must reach lane N, or a dead lane reads healthy
+    // forever. Above the pick so a pin always wins.
+    const pinned = resolvePinnedLane({
+      headers: req.headers,
+      proxyUser: auth.user,
+      proxyPass: auth.pass,
+      lanes,
+      proxyAuth: RELAY_PROXY_AUTH,
+    });
     const lane = pinned || lanes.pick(key) || lanes.lanes[0];
     try {
       const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
@@ -453,9 +465,16 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ error: "Invalid relay path" }));
   }
 
-  // Task 7 replaces this with resolvePinnedLane(): keep-cold traffic naming a
-  // lane. Until then every request is load-balanced.
-  const pinned = null;
+  // keep-cold traffic may name its lane so a probe measures the egress it
+  // reports on. Everything else is load-balanced. `auth` is defined above, so
+  // the userinfo form needs no second credential parse.
+  const pinned = resolvePinnedLane({
+    headers: req.headers,
+    proxyUser: auth.user,
+    proxyPass: auth.pass,
+    lanes,
+    proxyAuth: RELAY_PROXY_AUTH,
+  });
   let lane = pinned || lanes.pick(key);
   if (!lane) {
     res.writeHead(503, { "content-type": "application/json", "retry-after": "30" });
@@ -530,7 +549,12 @@ const server = http.createServer(async (req, res) => {
         // A client abort is not the lane's fault: it would evict a healthy
         // lane and then retry a request whose client is already gone.
         if (controller.signal.aborted) break;
-        lanes.cool(lane, LANE_COOLDOWN_MS, "lane connect failed");
+        // Only the lane's own SOCKS hop failing says the lane is bad. Anything
+        // past it — TLS handshake, DNS, redirect — is the target's problem, and
+        // cooling the lane for it would park a healthy egress.
+        const why = [err?.cause?.code, err?.cause?.message, err?.message].filter(Boolean).join(" ");
+        const connectFail = /ECONNREFUSED|SOCKS5|connect timeout|EHOSTUNREACH|ENETUNREACH/i.test(why);
+        if (connectFail) lanes.cool(lane, LANE_COOLDOWN_MS, "lane connect failed");
       }
 
       if (upstream) {
@@ -592,7 +616,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (upstream.status !== 429) lanes.bind(key, lane);
+    // A pinned lane is a measurement, not a preference: binding it to the
+    // sticky key would drag a probed session's later real traffic onto it.
+    if (upstream.status !== 429 && !pinned) lanes.bind(key, lane);
 
     // Forward only what the client needs: full header copies cost per-request
     // work and risk stale content-encoding/content-length (fetch decodes
@@ -699,7 +725,8 @@ server.on("connect", (req, clientSocket, head) => {
     deny(401, "Unauthorized");
     return;
   }
-  if (!proxyCredOk(req)) {
+  const auth = proxyAuthInfo(req);
+  if (!auth.ok) {
     deny(407, "Proxy Authentication Required", `Proxy-Authenticate: ${PROXY_AUTH_CHALLENGE}\r\n`);
     return;
   }
@@ -708,7 +735,15 @@ server.on("connect", (req, clientSocket, head) => {
     return;
   }
   // A tunnel occupies one egress for its whole life: pick once, never re-pick.
-  const lane = lanes.pick(laneKey(req.headers, clientSocket.remoteAddress || ""));
+  // A keep-cold probe's `lane-N` credentials pin the tunnel to that lane.
+  const pinned = resolvePinnedLane({
+    headers: req.headers,
+    proxyUser: auth.user,
+    proxyPass: auth.pass,
+    lanes,
+    proxyAuth: RELAY_PROXY_AUTH,
+  });
+  const lane = pinned || lanes.pick(laneKey(req.headers, clientSocket.remoteAddress || ""));
   if (!lane) {
     deny(503, "Service Unavailable");
     return;

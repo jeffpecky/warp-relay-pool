@@ -9,6 +9,41 @@
 import http from "node:http";
 import { Readable } from "node:stream";
 
+// Lane targeting for keep-cold, the only caller allowed to name an egress.
+//
+// A probe that cannot address a specific lane cannot tell which lane it
+// measured, so a dead lane reads healthy forever. Two forms, both gated on the
+// probe marker and, for userinfo, on real credentials — otherwise any client
+// could pin an egress and defeat the spread. Returns a Lane or null; a null
+// means "not pinned", never "no lane".
+export function resolvePinnedLane({ headers = {}, proxyUser, proxyPass, lanes, proxyAuth } = {}) {
+  const h = headers || {};
+  if (h["x-keep-cold-probe"] === undefined) return null;
+  const all = Array.isArray(lanes) ? lanes : lanes?.lanes;
+  if (!Array.isArray(all) || all.length === 0) return null;
+
+  // Digits only: "01", " 2", "2.5", "1e1" are all typos, not lane 2.
+  const byIndex = (v) => {
+    if (typeof v !== "string" || !/^[1-9]\d*$/.test(v)) return null;
+    const n = Number(v);
+    if (!Number.isSafeInteger(n) || n > all.length) return null;
+    return all.find((l) => l?.n === n) ?? null;
+  };
+
+  const fromHeader = byIndex(h["x-relay-lane"]);
+  if (fromHeader) return fromHeader;
+
+  // Userinfo form: proxy-auth user "lane-N" plus the password half of the
+  // configured credential. No configured credential means no pin.
+  const m = /^lane-(\d+)$/.exec(String(proxyUser ?? ""));
+  if (!m) return null;
+  if (typeof proxyAuth !== "string" || proxyAuth === "") return null;
+  const colon = proxyAuth.indexOf(":");
+  const wantPass = colon < 0 ? "" : proxyAuth.slice(colon + 1);
+  if (wantPass === "" || proxyPass !== wantPass) return null;
+  return byIndex(m[1]);
+}
+
 export function laneKey(headers = {}, peerAddress = "") {
   const h = headers || {};
   for (const name of ["x-opencode-session", "x-session-affinity", "x-session-id"]) {
@@ -161,6 +196,18 @@ export function createLanes({
       rr = (rr % count) + 1;
       const lane = byN.get(rr);
       if (usable(lane)) {
+        bindSticky(key, lane);
+        return lane;
+      }
+    }
+    // Every lane is parked. A 429 cooldown is a throttle on the egress IP, not
+    // a dead lane, so serving through one is strictly better than answering
+    // 503 to the whole fleet for the rest of the window. Lanes parked by a
+    // failed probe stay excluded — that really is a broken egress.
+    for (let i = 0; i < count; i++) {
+      rr = (rr % count) + 1;
+      const lane = byN.get(rr);
+      if (!lane.sick && Date.now() >= lane.probeOutUntil) {
         bindSticky(key, lane);
         return lane;
       }
