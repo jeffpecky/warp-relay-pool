@@ -142,6 +142,47 @@ test("a client that dies mid-buffer rejects instead of hanging", async () => {
   await assert.rejects(readReplayableBody(req, 1024), /aborted/);
 });
 
+test("GET and HEAD skip the body entirely", async () => {
+  for (const method of ["GET", "HEAD"]) {
+    const req = Readable.from([Buffer.from("ignored")]);
+    req.method = method;
+    const out = await readReplayableBody(req, 1024);
+    assert.deepEqual(out, { replayable: true, body: null }, `${method} must not read or buffer`);
+  }
+});
+
+test("the first chunk already over the cap still streams whole", async () => {
+  const out = await readReplayableBody(Readable.from([Buffer.alloc(100, "x")]), 10);
+  assert.equal(out.replayable, false);
+  const got = [];
+  for await (const c of out.body) got.push(c);
+  assert.equal(Buffer.concat(got).length, 100);
+});
+
+test("destroying the overflow stream destroys the client request", async () => {
+  // Without this the request never completes, so keep-alive parks the socket.
+  async function* src() {
+    for (let i = 0; i < 50; i++) yield Buffer.alloc(40, "y");
+  }
+  const req = Readable.from(src());
+  const out = await readReplayableBody(req, 10);
+  assert.equal(out.replayable, false);
+  out.body.destroy();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(req.destroyed, true, "the source req must be torn down with the body");
+});
+
+test("a non-finite cap falls back to the documented default, a negative one disables replay", async () => {
+  // A NaN cap makes every `size > cap` comparison false — the cap must not vanish.
+  const big = [Buffer.alloc(900_000, "a"), Buffer.alloc(900_000, "b")];
+  const nan = await readReplayableBody(Readable.from(big), NaN);
+  assert.equal(nan.replayable, false, "NaN must not disable the cap");
+  nan.body?.destroy?.();
+  const neg = await readReplayableBody(Readable.from([Buffer.from("hi")]), -5);
+  assert.equal(neg.replayable, false, "a negative cap must not buffer");
+  neg.body?.destroy?.();
+});
+
 test("a 429 replays a POST", () => {
   assert.equal(retryable({ method: "POST", status: 429, replayable: true }), true);
 });

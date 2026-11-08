@@ -41,6 +41,10 @@ export async function readReplayableBody(req, maxBytes) {
   // Tolerate a plain Readable (no .method): a missing method means "has a body".
   if (req.method === "GET" || req.method === "HEAD") return { replayable: true, body: null };
 
+  // A NaN/undefined cap would make every `size > maxBytes` false, i.e. unbounded.
+  if (!Number.isFinite(maxBytes)) maxBytes = 1_048_576;
+  else maxBytes = Math.max(0, Math.floor(maxBytes));
+
   const it = req[Symbol.asyncIterator]();
   const chunks = [];
   let size = 0;
@@ -53,15 +57,18 @@ export async function readReplayableBody(req, maxBytes) {
     size += buf.length;
     if (size > maxBytes) {
       const prefix = Buffer.concat(chunks);
-      return {
-        replayable: false,
-        body: Readable.from(
-          (async function* () {
-            yield prefix;
-            yield* it; // drain the rest without buffering it
-          })()
-        ),
-      };
+      const body = Readable.from(
+        (async function* () {
+          yield prefix;
+          yield* it; // drain the rest without buffering it
+        })()
+      );
+      // The generator is suspended in it.next(), so destroying `body` alone never
+      // reaches req — the request would stay open for the whole keep-alive window.
+      body.once("close", () => {
+        if (!req.destroyed) req.destroy();
+      });
+      return { replayable: false, body };
     }
   }
 }
