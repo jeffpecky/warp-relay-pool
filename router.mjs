@@ -18,6 +18,20 @@ export function laneKey(headers = {}, peerAddress = "") {
   return String(peerAddress || "").trim() || "unknown";
 }
 
+// Should the HTTP attempt loop try another lane? Pure predicate, no I/O.
+// Order matters: a pre-response failure is retryable even when the body was
+// streamed, because no request reached the upstream; once a body was forwarded
+// untouched, only a status we can replay without the body counts.
+export function retryable({ method, status, error, replayable } = {}) {
+  if (error) return true;
+  if (replayable === false) return false;
+  if (status === 429) return true;
+  if (status === 502 || status === 503 || status === 504) {
+    return method === "GET" || method === "HEAD";
+  }
+  return false;
+}
+
 // Buffer a small request body so a retry can replay it; a body past the cap is
 // forwarded as a stream and never retried. Reads the un-read portion of req
 // itself, so a Content-Length and a chunked body take the same path.

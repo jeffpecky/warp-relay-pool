@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import { createLanes, laneKey, readReplayableBody } from "../router.mjs";
+import { createLanes, laneKey, readReplayableBody, retryable } from "../router.mjs";
 
 const quiet = () => {};
 function pool(count, over = {}) {
@@ -140,4 +140,21 @@ test("a body over the cap streams and is not replayable", async () => {
 test("a client that dies mid-buffer rejects instead of hanging", async () => {
   const req = new Readable({ read() { this.destroy(Object.assign(new Error("aborted"), { code: "ECONNRESET" })); } });
   await assert.rejects(readReplayableBody(req, 1024), /aborted/);
+});
+
+test("a 429 replays a POST", () => {
+  assert.equal(retryable({ method: "POST", status: 429, replayable: true }), true);
+});
+test("a 502 replays a GET but never a POST", () => {
+  assert.equal(retryable({ method: "GET", status: 502, replayable: true }), true);
+  assert.equal(retryable({ method: "POST", status: 502, replayable: true }), false);
+});
+test("a 504 never replays a POST", () => {
+  assert.equal(retryable({ method: "POST", status: 504, replayable: true }), false);
+});
+test("a connect error replays regardless of method", () => {
+  assert.equal(retryable({ method: "POST", error: new Error("ECONNREFUSED"), replayable: true }), true);
+});
+test("a non-replayable body is never retried", () => {
+  assert.equal(retryable({ method: "POST", status: 429, replayable: false }), false);
 });
