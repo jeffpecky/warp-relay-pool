@@ -6,11 +6,12 @@ import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Agent } from "undici";
 import { createSignalWriter } from "./signal-writer.mjs";
+import { createLanes, laneKey, readReplayableBody, retryable } from "./router.mjs";
 
 const COUNT = parseInt(process.env.RELAY_COUNT || "10", 10);
-// Per-listener in-flight cap. Streaming responses hold sockets for minutes,
-// and the relay intentionally has no request timeout, so unbounded fan-in is
-// the one way this process can exhaust memory. 0 disables the cap.
+// Per-process in-flight cap. Streaming responses hold sockets for minutes, and
+// the relay intentionally has no request timeout, so unbounded fan-in is the
+// one way this process can exhaust memory. 0 disables the cap.
 const MAX_INFLIGHT = parseInt(process.env.RELAY_MAX_INFLIGHT || "256", 10);
 const BASE_PORT = parseInt(process.env.BASE_PORT || "3000", 10);
 const HEADER_TARGET = "x-relay-target";
@@ -37,8 +38,8 @@ const RELAY_AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "";
 // CONNECT, exact-origin hits included. Unlike `x-relay-auth` this is
 // speakable by ordinary proxy clients (curl -U, browsers, undici ProxyAgent
 // reads `http://user:pass@host` userinfo), which is why the public arm uses
-// it. The health path (no target) stays exempt: keep-cold and the mux probe
-// through it, and it answers only relay metadata, never upstream data.
+// it. The health path (no target) stays exempt: keep-cold probes through it,
+// and it answers only relay metadata, never upstream data.
 // The public arm means credentials cross an untrusted network, so compare them
 // in constant time: hash both sides to a fixed 32 bytes first (timingSafeEqual
 // throws on unequal lengths, which would itself leak the secret's length).
@@ -51,20 +52,42 @@ function secretEquals(given, expected) {
   return timingSafeEqual(a, b);
 }
 
-function proxyCredOk(req) {
-  if (!RELAY_PROXY_AUTH) return true;
+// Parse the relay's own Basic gate once: the connect path and the request path
+// both need the decoded credentials, not just a yes/no.
+function proxyAuthInfo(req) {
+  if (!RELAY_PROXY_AUTH) return { ok: true, user: null, pass: null };
   const header = String(req.headers["proxy-authorization"] || "");
   const space = header.indexOf(" ");
-  if (!/^basic$/i.test(header.slice(0, space).trim())) return false;
+  if (!/^basic$/i.test(header.slice(0, space).trim())) return { ok: false, user: null, pass: null };
   const decoded = Buffer.from(header.slice(space + 1), "base64").toString("utf8");
-  return secretEquals(decoded, RELAY_PROXY_AUTH);
+  if (!secretEquals(decoded, RELAY_PROXY_AUTH)) return { ok: false, user: null, pass: null };
+  const colon = decoded.indexOf(":");
+  return {
+    ok: true,
+    user: colon < 0 ? decoded : decoded.slice(0, colon),
+    pass: colon < 0 ? "" : decoded.slice(colon + 1),
+  };
 }
 
-// Mux env ints arrive in seconds; clamp to sane bounds per knob.
-function intEnv(raw, fallback) {
-  const n = parseInt(raw ?? "", 10);
-  return Number.isFinite(n) ? n : fallback;
+function proxyCredOk(req) {
+  return proxyAuthInfo(req).ok;
 }
+
+// A missing or non-numeric knob takes the documented default; so does an
+// out-of-range one, except where 0 is meaningful (0 retries, no probes).
+function laneEnv(name, fallback, { min = 1, allowZero = false } = {}) {
+  const n = parseInt(process.env[name] ?? "", 10);
+  if (!Number.isFinite(n)) return fallback;
+  if (n === 0 && allowZero) return 0;
+  return n < min ? fallback : n;
+}
+
+const RETRY_MAX = laneEnv("RELAY_LANE_RETRY_MAX", 3, { allowZero: true });
+const RETRY_MAX_BODY = laneEnv("RELAY_LANE_RETRY_MAX_BODY", 1048576);
+const STICKY_MAX = laneEnv("RELAY_LANE_STICKY_MAX", 10000);
+const LANE_PROBE_MS = laneEnv("RELAY_LANE_PROBE_S", 30, { allowZero: true }) * 1000;
+const LANE_COOLDOWN_MS = laneEnv("RELAY_LANE_COOLDOWN_S", 240) * 1000;
+const LANE_COOLDOWN_429_MS = laneEnv("RELAY_LANE_429_S", 120) * 1000;
 
 // Universal-proxy allowlist matcher. Each entry is one of:
 //   exact origin  ("https://opencode.ai")
@@ -147,8 +170,6 @@ process.on("uncaughtException", (err) => {
   signalWriter?.flush();
   process.exit(1);
 });
-
-const servers = [];
 
 // undici's ProxyAgent drops the client tuning options on its SOCKS5 branch
 // (Socks5ProxyAgent builds its Pool from dispatch options, which fetch never
@@ -277,9 +298,9 @@ const DROP_HEADERS = new Set([
   "accept-encoding",
 ]);
 
-// The upstream status alone does not say which model was throttled, and the
-// body cannot be buffered (streaming requests, memory). This tee reads the
-// model field out of the first MODEL_SCAN_BYTES and forwards every byte.
+// The upstream status alone does not say which model was throttled, and a
+// streamed body cannot be buffered (memory). This tee reads the model field
+// out of the first MODEL_SCAN_BYTES and forwards every byte.
 function createModelSniffer() {
   let seen = "";
   const sniffer = new Transform({
@@ -298,355 +319,427 @@ function createModelSniffer() {
   return sniffer;
 }
 
-function createRelayInstance(index) {
-  const port = BASE_PORT + index;
-  const warpHost = process.env[`WARP_HOST_${index}`] || `warp-${index}`;
-  const warpPort = process.env[`WARP_PORT_${index}`] || "1080";
-  const proxyUrl = `socks5://${warpHost}:${warpPort}`;
-  const dispatcher = new Agent({
-    connect: socks5Connector(warpHost, warpPort, 30_000),
-    keepAliveTimeout: 60_000,
-    keepAliveMaxTimeout: 90_000,
-    headersTimeout: 60_000,
-    bodyTimeout: 0,
-    connections: 32,
+// One agent per lane: `connections` is per-destination, keep-alive lets the
+// warp-<n> SOCKS hop be reused across requests.
+const lanes = createLanes({
+  count: COUNT,
+  agentFor: (n) =>
+    new Agent({
+      connect: socks5Connector(process.env[`WARP_HOST_${n}`] || `warp-${n}`, process.env[`WARP_PORT_${n}`] || "1080", 30_000),
+      keepAliveTimeout: 60_000,
+      keepAliveMaxTimeout: 90_000,
+      headersTimeout: 60_000,
+      bodyTimeout: 0,
+      connections: 32,
+    }),
+  probeIntervalMs: LANE_PROBE_MS,
+  cooldownMs: LANE_COOLDOWN_MS,
+  cooldown429Ms: LANE_COOLDOWN_429_MS,
+  stickyMax: STICKY_MAX,
+  log: (msg) => console.log(`[router] ${msg}`),
+});
+
+let inflight = 0;
+
+const server = http.createServer(async (req, res) => {
+  // A client that vanishes mid-response must not surface as an unhandled
+  // 'error' event on either side.
+  req.on("error", () => {});
+  res.on("error", () => {});
+
+  if (MAX_INFLIGHT > 0 && inflight >= MAX_INFLIGHT) {
+    res.writeHead(503, { "content-type": "application/json", "retry-after": "5" });
+    return res.end(JSON.stringify({ error: "Relay busy" }));
+  }
+  inflight += 1;
+  res.once("close", () => {
+    inflight -= 1;
   });
 
-  let inflight = 0;
+  const key = laneKey(req.headers, req.socket?.remoteAddress || "");
+  const auth = proxyAuthInfo(req);
 
-  const server = http.createServer(async (req, res) => {
-    // A client that vanishes mid-response must not surface as an unhandled
-    // 'error' event on either side.
-    req.on("error", () => {});
-    res.on("error", () => {});
+  let target = req.headers[HEADER_TARGET]?.replace(/\/$/, "");
+  let relayPath = req.headers[HEADER_PATH] || "/";
 
-    if (MAX_INFLIGHT > 0 && inflight >= MAX_INFLIGHT) {
-      res.writeHead(503, { "content-type": "application/json", "retry-after": "5" });
-      return res.end(JSON.stringify({ error: "Relay busy" }));
-    }
-    inflight += 1;
-    res.once("close", () => {
-      inflight -= 1;
-    });
-
-    let target = req.headers[HEADER_TARGET]?.replace(/\/$/, "");
-    let relayPath = req.headers[HEADER_PATH] || "/";
-
-    // Standard forward-proxy absolute-form: `GET http://host/path` arrives
-    // with req.url as the absolute URI. When x-relay-target is absent,
-    // derive target+path from it so plain proxy clients work header-free.
-    if (!target && typeof req.url === "string" && /^https?:\/\//i.test(req.url)) {
-      try {
-        const abs = new URL(req.url);
-        if (abs.protocol === "http:" || abs.protocol === "https:") {
-          target = abs.origin;
-          relayPath = (abs.pathname + abs.search) || "/";
-        }
-      } catch {
-        // Fall through to the health check below.
-      }
-    }
-
-    // Direct health check: only when NO x-relay-target header is passed
-    // (and the request line is not absolute-form). Exempt from the token gate.
-    if (!target) {
-      try {
-        const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
-          dispatcher,
-          signal: AbortSignal.timeout(5_000),
-        });
-        if (!trace.ok) throw new Error(`trace HTTP ${trace.status}`);
-        const text = await trace.text();
-        res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
-        return res.end(`Relay #${index} OK (via ${proxyUrl})\n\n${text}`);
-      } catch (err) {
-        // Detail stays in the logs: the body used to reflect String(err).
-        console.error(`[relay #${index}] health check failed: ${err?.stack ?? String(err)}`);
-        res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
-        return res.end(`Relay #${index} health check failed\n`);
-      }
-    }
-
-    const match = matchTarget(target);
-    if (!match.matched) {
-      res.writeHead(403, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ error: "Forbidden target" }));
-    }
-    if (!isAuthorized(req, match)) {
-      res.writeHead(401, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ error: "Unauthorized" }));
-    }
-    if (!proxyCredOk(req)) {
-      res.writeHead(407, {
-        "content-type": "application/json",
-        "proxy-authenticate": PROXY_AUTH_CHALLENGE,
-      });
-      return res.end(JSON.stringify({ error: "Proxy authentication required" }));
-    }
-
-    // The allowlist check above only validates the raw header string; the
-    // request URL is target + relayPath, and a crafted path can continue the
-    // host label (".attacker.tld/x" -> opencode.ai.attacker.tld), swap the
-    // port (":8443/x"), or inject userinfo ("@evil.tld/x"). Build the URL
-    // once and require it to stay on the allowlisted origin with a rooted
-    // path. Concat (not URL-relative resolution) preserves the legacy
-    // target+path semantics for any allowlist entry carrying a base path.
-    let upstreamUrl;
-    let targetOrigin;
+  // Standard forward-proxy absolute-form: `GET http://host/path` arrives
+  // with req.url as the absolute URI. When x-relay-target is absent,
+  // derive target+path from it so plain proxy clients work header-free.
+  if (!target && typeof req.url === "string" && /^https?:\/\//i.test(req.url)) {
     try {
-      targetOrigin = new URL(target).origin;
-      upstreamUrl = new URL(target + relayPath);
+      const abs = new URL(req.url);
+      if (abs.protocol === "http:" || abs.protocol === "https:") {
+        target = abs.origin;
+        relayPath = (abs.pathname + abs.search) || "/";
+      }
     } catch {
-      upstreamUrl = null;
+      // Fall through to the health check below.
     }
-    if (!upstreamUrl || upstreamUrl.origin !== targetOrigin || !relayPath.startsWith("/")) {
-      console.error(`[relay #${index}] rejected relay path: target=${target} path=${relayPath}`);
-      res.writeHead(400, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ error: "Invalid relay path" }));
-    }
+  }
 
-    const headers = new Headers();
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (!DROP_HEADERS.has(k) && v !== undefined) {
-        headers.set(k, v);
-      }
+  // Direct health check: only when NO x-relay-target header is passed
+  // (and the request line is not absolute-form). Exempt from the token gate.
+  if (!target) {
+    const lane = lanes.pick(key);
+    if (!lane) {
+      res.writeHead(503, { "content-type": "application/json", "retry-after": "30" });
+      return res.end(JSON.stringify({ error: "No relay available" }));
     }
-
-    // 5-min upstream cap + client-disconnect wiring: a client that goes away
-    // must not leave its upstream fetch hanging (leaked sockets pile up under
-    // agent retries). Note req 'close' also fires on normal POST body
-    // completion (socket still alive), so only abort when the socket actually
-    // died; res 'close' covers disconnect-while-waiting for all methods.
-    const controller = new AbortController();
-    const onClientClose = () => {
-      if (!res.writableEnded && req.socket?.destroyed) controller.abort();
-    };
-    req.once("close", onClientClose);
-    res.once("close", onClientClose);
-    const upstreamTimeout = AbortSignal.timeout(300000);
-    // Only bodies can name a model; with signals off the request object is
-    // handed to fetch exactly as before. Probe traffic is never signalled: the
-    // controller would otherwise chase throttles its own probes reported.
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
-    const isProbe = req.headers[HEADER_PROBE] !== undefined;
-    const sniffer = signalWriter && hasBody && !isProbe ? createModelSniffer() : null;
     try {
-      const upstream = await fetch(upstreamUrl, {
-        method: req.method,
-        headers,
-        body: hasBody ? (sniffer ? req.pipe(sniffer) : req) : undefined,
-        duplex: "half",
-        // The allowlist constrains the first hop only; following a redirect
-        // would let an allowlisted origin steer the relay to any host.
-        redirect: "error",
-        dispatcher,
-        signal: AbortSignal.any([upstreamTimeout, controller.signal]),
+      const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
+        dispatcher: lane.agent,
+        signal: AbortSignal.timeout(5_000),
       });
+      if (!trace.ok) throw new Error(`trace HTTP ${trace.status}`);
+      const text = await trace.text();
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      return res.end(`Relay #${lane.n} OK (via socks5://${lane.host}:${lane.port})\n\n${text}`);
+    } catch (err) {
+      // Detail stays in the logs: the body used to reflect String(err).
+      console.error(`[relay #${lane.n}] health check failed: ${err?.stack ?? String(err)}`);
+      lanes.cool(lane, LANE_COOLDOWN_MS, "health check failed");
+      res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
+      return res.end(`Relay #${lane.n} health check failed\n`);
+    }
+  }
 
-      if (signalWriter && !isProbe) {
-        // Best-effort and additive: a signal failure must never reach the
-        // response path.
-        try {
-          const model = sniffer?.model ?? "unknown";
-          if (upstream.status === 429) {
-            signalWriter.record({
-              relay: index,
-              model,
-              status: 429,
-              retryAfter: Number(upstream.headers.get("retry-after")) || null,
-            });
-          } else if (upstream.status === 200) {
-            signalWriter.record({ relay: index, model, status: 200 });
+  const match = matchTarget(target);
+  if (!match.matched) {
+    res.writeHead(403, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "Forbidden target" }));
+  }
+  if (!isAuthorized(req, match)) {
+    res.writeHead(401, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "Unauthorized" }));
+  }
+  if (!auth.ok) {
+    res.writeHead(407, {
+      "content-type": "application/json",
+      "proxy-authenticate": PROXY_AUTH_CHALLENGE,
+    });
+    return res.end(JSON.stringify({ error: "Proxy authentication required" }));
+  }
+
+  // The allowlist check above only validates the raw header string; the
+  // request URL is target + relayPath, and a crafted path can continue the
+  // host label (".attacker.tld/x" -> opencode.ai.attacker.tld), swap the
+  // port (":8443/x"), or inject userinfo ("@evil.tld/x"). Build the URL
+  // once and require it to stay on the allowlisted origin with a rooted
+  // path. Concat (not URL-relative resolution) preserves the legacy
+  // target+path semantics for any allowlist entry carrying a base path.
+  let upstreamUrl;
+  let targetOrigin;
+  try {
+    targetOrigin = new URL(target).origin;
+    upstreamUrl = new URL(target + relayPath);
+  } catch {
+    upstreamUrl = null;
+  }
+  if (!upstreamUrl || upstreamUrl.origin !== targetOrigin || !relayPath.startsWith("/")) {
+    console.error(`[relay] rejected relay path: target=${target} path=${relayPath}`);
+    res.writeHead(400, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "Invalid relay path" }));
+  }
+
+  // Task 7 replaces this with resolvePinnedLane(): keep-cold traffic naming a
+  // lane. Until then every request is load-balanced.
+  const pinned = null;
+  let lane = pinned || lanes.pick(key);
+  if (!lane) {
+    res.writeHead(503, { "content-type": "application/json", "retry-after": "30" });
+    return res.end(JSON.stringify({ error: "No relay available" }));
+  }
+
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (!DROP_HEADERS.has(k) && v !== undefined) {
+      headers.set(k, v);
+    }
+  }
+
+  const hasBody = req.method !== "GET" && req.method !== "HEAD";
+  const isProbe = req.headers[HEADER_PROBE] !== undefined;
+  const sniffEnabled = Boolean(signalWriter) && hasBody && !isProbe;
+  const { replayable, body: reqBody } = await readReplayableBody(req, RETRY_MAX_BODY);
+  const sniffer = sniffEnabled && reqBody && !Buffer.isBuffer(reqBody) ? createModelSniffer() : null;
+
+  // One tee per process; a buffered body is sniffed directly instead.
+  const modelOf = () => {
+    if (!sniffEnabled) return "unknown";
+    if (Buffer.isBuffer(reqBody)) {
+      const m = MODEL_FIELD_RE.exec(reqBody.subarray(0, MODEL_SCAN_BYTES).toString("latin1"));
+      return m ? m[1] : "unknown";
+    }
+    return sniffer?.model ?? "unknown";
+  };
+
+  // 5-min upstream cap + client-disconnect wiring: a client that goes away
+  // must not leave its upstream fetch hanging (leaked sockets pile up under
+  // agent retries). Note req 'close' also fires on normal POST body
+  // completion (socket still alive), so only abort when the socket actually
+  // died; res 'close' covers disconnect-while-waiting for all methods.
+  const controller = new AbortController();
+  const onClientClose = () => {
+    if (!res.writableEnded && req.socket?.destroyed) controller.abort();
+  };
+  req.once("close", onClientClose);
+  res.once("close", onClientClose);
+  const upstreamTimeout = AbortSignal.timeout(300000);
+
+  let upstream = null;
+  let failure = null;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      upstream = null;
+      failure = null;
+      try {
+        upstream = await fetch(upstreamUrl, {
+          method: req.method,
+          headers,
+          body: reqBody === null ? undefined : sniffer ? reqBody.pipe(sniffer) : reqBody,
+          duplex: "half",
+          // The allowlist constrains the first hop only; following a redirect
+          // would let an allowlisted origin steer the relay to any host.
+          redirect: "error",
+          dispatcher: lane.agent,
+          signal: AbortSignal.any([upstreamTimeout, controller.signal]),
+        });
+      } catch (err) {
+        failure = err;
+        lanes.cool(lane, LANE_COOLDOWN_MS, "lane connect failed");
+      }
+
+      if (upstream) {
+        if (signalWriter && !isProbe) {
+          // Best-effort and additive: a signal failure must never reach the
+          // response path. Every throttled attempt is recorded, not just the
+          // one whose response the client finally sees.
+          try {
+            if (upstream.status === 429) {
+              signalWriter.record({
+                relay: lane.n,
+                model: modelOf(),
+                status: 429,
+                retryAfter: Number(upstream.headers.get("retry-after")) || null,
+              });
+            } else if (upstream.status === 200) {
+              signalWriter.record({ relay: lane.n, model: modelOf(), status: 200 });
+            }
+          } catch {
+            // Ignored: keep-cold falls back to probing.
           }
+        }
+        if (upstream.status === 429) {
+          lanes.cool(lane, LANE_COOLDOWN_429_MS, "429 from upstream", "signal");
+        }
+        // A status retry needs the body re-sent, so only a buffered (or
+        // bodyless) request may continue; `retryable` enforces that.
+        if (!retryable({ method: req.method, status: upstream.status, replayable })) break;
+      }
+
+      // A one-shot body cannot be replayed: the attempt already consumed part
+      // of it, so a retry would send a truncated request. ponytail: the ceiling
+      // is one attempt for bodies over RELAY_LANE_RETRY_MAX_BODY; upgrade by
+      // spooling to a temp file.
+      const canRetry = !pinned && replayable && attempt < RETRY_MAX;
+      if (!canRetry) break;
+      const next = lanes.pick(key);
+      if (!next) break;
+      if (upstream?.body) {
+        try {
+          await upstream.body.cancel();
         } catch {
-          // Ignored: keep-cold falls back to probing.
+          // Ignored: the body is being discarded either way.
         }
       }
+      lane = next;
+    }
 
-      // Forward only what the client needs: full header copies cost per-request
-      // work and risk stale content-encoding/content-length (fetch decodes
-      // gzip/deflate/br, so those upstream values lie about our body).
-      const outHeaders = { "cache-control": "no-cache", "x-accel-buffering": "no" };
-      const contentType = upstream.headers.get("content-type");
-      if (contentType) outHeaders["content-type"] = contentType;
-      const retryAfter = upstream.headers.get("retry-after");
-      if (retryAfter) outHeaders["retry-after"] = retryAfter;
-      res.writeHead(upstream.status, outHeaders);
-      // Kickstart: Node buffers headers until the first body byte, so TTFB
-      // would wait for the first token. Flush now — headers land at
-      // upstream-headers time instead.
-      res.flushHeaders();
-      if (upstream.body) {
-        // Zero-copy pipe with backpressure; for-await + res.write() costs a
-        // microtask per chunk and buffers against a slow client.
-        await pipeline(Readable.fromWeb(upstream.body), res);
-      } else {
-        res.end();
-      }
-    } catch (err) {
+    if (failure) {
+      // Body stays generic: String(err) reflected attacker-controlled URLs
+      // and internal proxy names back to the caller.
+      console.error(`[relay #${lane.n}] upstream error: ${failure?.stack ?? String(failure)}`);
       if (!res.headersSent) {
-        // Body stays generic: String(err) reflected attacker-controlled URLs
-        // and internal proxy names back to the caller.
-        console.error(`[relay #${index}] upstream error: ${err?.stack ?? String(err)}`);
         res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "upstream request failed" }));
       } else {
-        // Headers already on the wire (mid-stream failure) — just cut it.
-        // Unconditional writeHead here crashed the process (ERR_HTTP_HEADERS_SENT).
         res.destroy();
       }
-    } finally {
-      req.removeListener("close", onClientClose);
-      res.removeListener("close", onClientClose);
-    }
-  });
-
-  // TTFT tuning: Nagle off (first small frame goes immediately), long
-  // keep-alive so cloudflared reuses the relay-app connection.
-  server.keepAliveTimeout = 90_000;
-  server.headersTimeout = 95_000;
-  server.requestTimeout = 0;
-  server.timeout = 0;
-  server.on("connection", (socket) => socket.setNoDelay(true));
-  // Standard forward-proxy CONNECT: host:port is restricted to 443/80, the
-  // hostname is matched as an https-origin through the same allowlist, and
-  // the token gate applies (exact hits exempt). On success the relay answers
-  // 200 and pipes raw TCP over a SOCKS-connected socket — no interception,
-  // no redirect following. The in-flight guard mirrors the request path.
-  server.on("connect", (req, clientSocket, head) => {
-    req.on("error", () => {});
-    clientSocket.on("error", () => {});
-    const deny = (code, text, extraHeaders = "") => {
-      try {
-        clientSocket.write(
-          `HTTP/1.1 ${code} ${text}\r\nContent-Length: 0\r\n${extraHeaders}\r\n`
-        );
-      } catch {
-        // Ignored: the client is already gone.
-      }
-      clientSocket.destroy();
-    };
-    if (MAX_INFLIGHT > 0 && inflight >= MAX_INFLIGHT) {
-      deny(503, "Service Unavailable");
       return;
     }
-    inflight += 1;
-    clientSocket.once("close", () => {
-      inflight -= 1;
-    });
-    // CONNECT authority is "hostname:port" ("[v6]:port" for literals).
-    let host = null;
-    let portNum = 0;
-    const authority = req.url || "";
-    const v6 = authority.match(/^\[([^\]]+)\]:(\d+)$/);
-    if (v6) {
-      host = v6[1];
-      portNum = Number(v6[2]);
+
+    if (upstream.status !== 429) lanes.bind(key, lane);
+
+    // Forward only what the client needs: full header copies cost per-request
+    // work and risk stale content-encoding/content-length (fetch decodes
+    // gzip/deflate/br, so those upstream values lie about our body).
+    const outHeaders = { "cache-control": "no-cache", "x-accel-buffering": "no" };
+    const contentType = upstream.headers.get("content-type");
+    if (contentType) outHeaders["content-type"] = contentType;
+    const retryAfter = upstream.headers.get("retry-after");
+    if (retryAfter) outHeaders["retry-after"] = retryAfter;
+    res.writeHead(upstream.status, outHeaders);
+    // Kickstart: Node buffers headers until the first body byte, so TTFB
+    // would wait for the first token. Flush now — headers land at
+    // upstream-headers time instead.
+    res.flushHeaders();
+    if (upstream.body) {
+      // Zero-copy pipe with backpressure; for-await + res.write() costs a
+      // microtask per chunk and buffers against a slow client.
+      await pipeline(Readable.fromWeb(upstream.body), res);
     } else {
-      const idx = authority.lastIndexOf(":");
-      if (idx > 0) {
-        const h = authority.slice(0, idx);
-        const p = authority.slice(idx + 1);
-        if (h && /^\d+$/.test(p) && !h.includes(":")) {
-          host = h;
-          portNum = Number(p);
-        }
+      res.end();
+    }
+  } catch (err) {
+    if (!res.headersSent) {
+      console.error(`[relay #${lane.n}] upstream error: ${err?.stack ?? String(err)}`);
+      res.writeHead(502, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "upstream request failed" }));
+    } else {
+      // Headers already on the wire (mid-stream failure) — just cut it.
+      // Unconditional writeHead here crashed the process (ERR_HTTP_HEADERS_SENT).
+      res.destroy();
+    }
+  } finally {
+    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
+    // An unconsumed streamed body would leave the client socket paused; the
+    // destroy also tears down `req` through router.mjs's close handler.
+    if (reqBody && !Buffer.isBuffer(reqBody)) reqBody.destroy();
+  }
+});
+
+// TTFT tuning: Nagle off (first small frame goes immediately), long
+// keep-alive so cloudflared reuses the relay-app connection.
+server.keepAliveTimeout = 90_000;
+server.headersTimeout = 95_000;
+server.requestTimeout = 0;
+server.timeout = 0;
+server.on("connection", (socket) => socket.setNoDelay(true));
+
+// Standard forward-proxy CONNECT: host:port is restricted to 443/80, the
+// hostname is matched as an https-origin through the same allowlist, and the
+// token gate applies (exact hits exempt). On success the relay answers 200 and
+// pipes raw TCP over a SOCKS-connected socket — no interception, no redirect
+// following. The in-flight guard mirrors the request path.
+server.on("connect", (req, clientSocket, head) => {
+  req.on("error", () => {});
+  clientSocket.on("error", () => {});
+  const deny = (code, text, extraHeaders = "") => {
+    try {
+      clientSocket.write(`HTTP/1.1 ${code} ${text}\r\nContent-Length: 0\r\n${extraHeaders}\r\n`);
+    } catch {
+      // Ignored: the client is already gone.
+    }
+    clientSocket.destroy();
+  };
+  if (MAX_INFLIGHT > 0 && inflight >= MAX_INFLIGHT) {
+    deny(503, "Service Unavailable");
+    return;
+  }
+  inflight += 1;
+  clientSocket.once("close", () => {
+    inflight -= 1;
+  });
+  // CONNECT authority is "hostname:port" ("[v6]:port" for literals).
+  let host = null;
+  let portNum = 0;
+  const authority = req.url || "";
+  const v6 = authority.match(/^\[([^\]]+)\]:(\d+)$/);
+  if (v6) {
+    host = v6[1];
+    portNum = Number(v6[2]);
+  } else {
+    const idx = authority.lastIndexOf(":");
+    if (idx > 0) {
+      const h = authority.slice(0, idx);
+      const p = authority.slice(idx + 1);
+      if (h && /^\d+$/.test(p) && !h.includes(":")) {
+        host = h;
+        portNum = Number(p);
       }
     }
-    if (!host || !Number.isInteger(portNum)) {
-      deny(403, "Forbidden");
+  }
+  if (!host || !Number.isInteger(portNum)) {
+    deny(403, "Forbidden");
+    return;
+  }
+  // Hostname matched as an https-origin through the shared matcher.
+  const hostForUrl = host.includes(":") ? `[${host}]` : host;
+  const match = matchTarget(`https://${hostForUrl}`);
+  if (!match.matched) {
+    deny(403, "Forbidden");
+    return;
+  }
+  if (!isAuthorized(req, match)) {
+    deny(401, "Unauthorized");
+    return;
+  }
+  if (!proxyCredOk(req)) {
+    deny(407, "Proxy Authentication Required", `Proxy-Authenticate: ${PROXY_AUTH_CHALLENGE}\r\n`);
+    return;
+  }
+  if (portNum !== 443 && portNum !== 80) {
+    deny(403, "Forbidden");
+    return;
+  }
+  // A tunnel occupies one egress for its whole life: pick once, never re-pick.
+  const lane = lanes.pick(laneKey(req.headers, clientSocket.remoteAddress || ""));
+  if (!lane) {
+    deny(503, "Service Unavailable");
+    return;
+  }
+  // Raw pipe: reuse the SOCKS handshake with a plain (non-TLS) protocol so
+  // the socket stays untampered. Port is explicit here (443/80 allowed).
+  const rawConnect = socks5Connector(lane.host, lane.port, 30_000);
+  rawConnect({ hostname: host, port: portNum, protocol: "http:" }, (err, targetSocket) => {
+    if (err) {
+      console.error(`[relay #${lane.n}] CONNECT error: ${err?.stack ?? String(err)}`);
+      lanes.cool(lane, LANE_COOLDOWN_MS, "CONNECT failed");
+      deny(502, "Bad Gateway");
       return;
     }
-    // Hostname matched as an https-origin through the shared matcher.
-    const hostForUrl = host.includes(":") ? `[${host}]` : host;
-    const match = matchTarget(`https://${hostForUrl}`);
-    if (!match.matched) {
-      deny(403, "Forbidden");
+    targetSocket.on("error", () => {});
+    try {
+      clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+    } catch {
+      targetSocket.destroy();
       return;
     }
-    if (!isAuthorized(req, match)) {
-      deny(401, "Unauthorized");
-      return;
-    }
-    if (!proxyCredOk(req)) {
-      deny(407, "Proxy Authentication Required", `Proxy-Authenticate: ${PROXY_AUTH_CHALLENGE}\r\n`);
-      return;
-    }
-    if (portNum !== 443 && portNum !== 80) {
-      deny(403, "Forbidden");
-      return;
-    }
-    // Raw pipe: reuse the SOCKS handshake with a plain (non-TLS) protocol so
-    // the socket stays untampered. Port is explicit here (443/80 allowed).
-    const rawConnect = socks5Connector(warpHost, warpPort, 30_000);
-    rawConnect({ hostname: host, port: portNum, protocol: "http:" }, (err, targetSocket) => {
-      if (err) {
-        console.error(`[relay #${index}] CONNECT error: ${err?.stack ?? String(err)}`);
-        deny(502, "Bad Gateway");
-        return;
-      }
-      targetSocket.on("error", () => {});
+    if (head && head.length) targetSocket.write(head);
+    clientSocket.pipe(targetSocket);
+    targetSocket.pipe(clientSocket);
+    const cleanup = () => {
       try {
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        clientSocket.destroy();
       } catch {
-        targetSocket.destroy();
-        return;
+        // Ignored.
       }
-      if (head && head.length) targetSocket.write(head);
-      clientSocket.pipe(targetSocket);
-      targetSocket.pipe(clientSocket);
-      const cleanup = () => {
-        try {
-          clientSocket.destroy();
-        } catch {
-          // Ignored.
-        }
-        try {
-          targetSocket.destroy();
-        } catch {
-          // Ignored.
-        }
-      };
-      clientSocket.once("close", cleanup);
-      targetSocket.once("close", cleanup);
-    });
+      try {
+        targetSocket.destroy();
+      } catch {
+        // Ignored.
+      }
+    };
+    clientSocket.once("close", cleanup);
+    targetSocket.once("close", cleanup);
   });
-  // A failed bind must be fatal: a half-started relay with missing listeners
-  // is invisible to `restart: always` and only shows up as per-port 502s.
-  server.on("error", (err) => {
-    console.error(`[relay #${index}] fatal listen error: ${err?.stack ?? String(err)}`);
-    signalWriter?.flush();
-    process.exit(1);
-  });
+});
 
-  servers.push(server);
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`Relay #${index} listening on 0.0.0.0:${port} -> ${proxyUrl}`);
-  });
-}
+// A failed bind must be fatal: a half-started relay is invisible to
+// `restart: always` and only shows up as a connection refused.
+server.on("error", (err) => {
+  console.error(`[relay] fatal listen error: ${err?.stack ?? String(err)}`);
+  signalWriter?.flush();
+  process.exit(1);
+});
 
-for (let i = 1; i <= COUNT; i++) {
-  createRelayInstance(i);
-}
-
-// All-in-one mux listener (mux.mjs): ONE client port that internally spreads
-// across every instance's listener above. Disabled with RELAY_MUX=0. It
-// listens on BASE_PORT itself; instance ports (BASE_PORT+1..) are untouched.
-const RELAY_MUX_ENABLED = process.env.RELAY_MUX !== "0";
-if (RELAY_MUX_ENABLED) {
-  const { startMux } = await import("./mux.mjs");
-  const mux = startMux({
-    basePort: BASE_PORT,
-    count: COUNT,
-    signalFile: LIVE_SIGNALS ? LIVE_SIGNAL_FILE : null,
-    probeIntervalMs: intEnv(process.env.RELAY_MUX_PROBE_S, 30) * 1000,
-    cooldownMs: intEnv(process.env.RELAY_MUX_COOLDOWN_S, 240) * 1000,
-    cooldown429Ms: intEnv(process.env.RELAY_MUX_429_S, 120) * 1000,
-    stickyMs: intEnv(process.env.RELAY_MUX_STICKY_S, 600) * 1000,
-    log: (msg) => console.log(msg),
-  });
-  servers.push(mux.server);
-}
+server.listen(BASE_PORT, "0.0.0.0", () => {
+  console.log(`listening on 0.0.0.0:${BASE_PORT} -> ${COUNT} lane(s)`);
+  // Without this nothing probes: sick lanes would never be parked or
+  // re-admitted, and RELAY_LANE_PROBE_S would be a no-op knob.
+  lanes.start();
+});
 
 // Drain on deploy: stop accepting, let in-flight streams finish, then force
 // the exit so a wedged connection cannot hold the container open.
@@ -654,12 +747,13 @@ let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[relay] ${signal} received — draining ${servers.length} listener(s)`);
+  console.log(`[relay] ${signal} received — draining`);
   signalWriter?.flush();
-  for (const server of servers) {
-    server.close();
-    server.closeIdleConnections?.();
-  }
+  // Timers only: closing the lane agents here would abort the in-flight
+  // streams the 10s drain exists to finish.
+  lanes.stop();
+  server.close();
+  server.closeIdleConnections?.();
   setTimeout(() => process.exit(0), 10_000).unref();
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
