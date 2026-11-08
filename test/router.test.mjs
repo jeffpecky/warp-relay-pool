@@ -1,7 +1,8 @@
 // test/router.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createLanes, laneKey } from "../router.mjs";
+import { Readable } from "node:stream";
+import { createLanes, laneKey, readReplayableBody } from "../router.mjs";
 
 const quiet = () => {};
 function pool(count, over = {}) {
@@ -119,4 +120,24 @@ test("construction rejects a non-positive stickyMax and a missing agentFor", () 
   assert.throws(() => createLanes({ count: 1, agentFor: (n) => ({ n }), stickyMax: -1 }), /stickyMax/);
   assert.throws(() => createLanes({ count: 1, agentFor: (n) => ({ n }), stickyMax: 0 }), /stickyMax/);
   assert.throws(() => createLanes({ count: 1 }), /agentFor/);
+});
+
+test("a body under the cap is buffered and replayable", async () => {
+  const out = await readReplayableBody(Readable.from([Buffer.from("hello ")]), 1024);
+  assert.equal(out.replayable, true);
+  assert.equal(out.body.toString(), "hello ");
+});
+
+test("a body over the cap streams and is not replayable", async () => {
+  const chunks = [Buffer.alloc(600, "a"), Buffer.alloc(600, "b")];
+  const out = await readReplayableBody(Readable.from(chunks), 512);
+  assert.equal(out.replayable, false);
+  const got = [];
+  for await (const c of out.body) got.push(c);
+  assert.equal(Buffer.concat(got).length, 1200, "no byte lost to the overflow");
+});
+
+test("a client that dies mid-buffer rejects instead of hanging", async () => {
+  const req = new Readable({ read() { this.destroy(Object.assign(new Error("aborted"), { code: "ECONNRESET" })); } });
+  await assert.rejects(readReplayableBody(req, 1024), /aborted/);
 });

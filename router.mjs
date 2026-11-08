@@ -7,6 +7,7 @@
 // - usable() = !sick && now >= probeOutUntil && now >= cool429Until.
 // - pick() returns null when nothing is usable; the caller owns the 503.
 import http from "node:http";
+import { Readable } from "node:stream";
 
 export function laneKey(headers = {}, peerAddress = "") {
   const h = headers || {};
@@ -15,6 +16,40 @@ export function laneKey(headers = {}, peerAddress = "") {
     if (typeof v === "string" && v.trim()) return v.trim();
   }
   return String(peerAddress || "").trim() || "unknown";
+}
+
+// Buffer a small request body so a retry can replay it; a body past the cap is
+// forwarded as a stream and never retried. Reads the un-read portion of req
+// itself, so a Content-Length and a chunked body take the same path.
+// ponytail: replay is memory-bound — upgrade by spilling to a temp file if
+// large replayable bodies ever matter.
+export async function readReplayableBody(req, maxBytes) {
+  // Tolerate a plain Readable (no .method): a missing method means "has a body".
+  if (req.method === "GET" || req.method === "HEAD") return { replayable: true, body: null };
+
+  const it = req[Symbol.asyncIterator]();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const step = await it.next(); // rejects if the client dies mid-read
+    if (step.done) return { replayable: true, body: Buffer.concat(chunks) };
+
+    const buf = Buffer.isBuffer(step.value) ? step.value : Buffer.from(step.value);
+    chunks.push(buf);
+    size += buf.length;
+    if (size > maxBytes) {
+      const prefix = Buffer.concat(chunks);
+      return {
+        replayable: false,
+        body: Readable.from(
+          (async function* () {
+            yield prefix;
+            yield* it; // drain the rest without buffering it
+          })()
+        ),
+      };
+    }
+  }
 }
 
 // Real health path: the same GET / a client's lane would answer.
