@@ -1269,3 +1269,84 @@ test("PROBE_TRANSPORT=wreq on a wreq-less host is fatal, not a silent degrade", 
   const after = fs.existsSync(logPath) ? fs.readFileSync(logPath, "utf8") : "";
   assert.equal(before, after, "no probe may execute without the truthful transport");
 });
+
+// ── case 9: --signals mode ─────────────────────────────────────────
+// --signals is the signal-only pass: no probes, no audit sample, just the
+// relays the records name. It exists so a minutes-granularity consumer can
+// act on a live 429 without paying for a full sweep.
+test("--signals restarts the named relay without probing anything", async () => {
+  const sc = newScenario({ count: 20 });
+  await startRelays(sc);
+  seedCleanState(sc);
+  fs.writeFileSync(sc.signalFile, JSON.stringify({
+    signals: [{ ts: Date.now(), relay: 12, model: "model-a", status: 429, retryAfter: null }],
+  }));
+  const r = await runOnce(sc, {}, ["--signals"]);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-12"]);
+  assert.equal(requests(sc, 12), 0, "--signals must not probe");
+  assert.deepEqual(JSON.parse(fs.readFileSync(sc.signalFile, "utf8")), { signals: [] });
+});
+
+test("--signals leaves a short retry-after alone", async () => {
+  const sc = newScenario({ count: 4 });
+  await startRelays(sc);
+  seedCleanState(sc);
+  fs.writeFileSync(sc.signalFile, JSON.stringify({
+    signals: [{ ts: Date.now(), relay: 2, model: "model-a", status: 429, retryAfter: 60 }],
+  }));
+  const r = await runOnce(sc, {}, ["--signals"]);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.deepEqual(restartLines(sc), []);
+  assert.match(r.stdout, /retry-after 60s/);
+});
+
+test("--signals restarts nothing when history says the model is quota-capped", async () => {
+  const sc = newScenario({ count: 20 });
+  await startRelays(sc);
+  const relays = {};
+  for (let i = 1; i <= 20; i++) {
+    relays[String(i)] = entry({
+      lastProbe: Date.now(), lastClean: Date.now(),
+      last429: { model: "model-a", ts: Date.now() - 60_000 },
+    });
+  }
+  writeStateFile(sc, relays);
+  fs.writeFileSync(sc.signalFile, JSON.stringify({
+    signals: [{ ts: Date.now(), relay: 3, model: "model-a", status: 429, retryAfter: null }],
+  }));
+  const r = await runOnce(sc, { GLOBAL_QUOTA_GUARD: "9" }, ["--signals"]);
+  assert.deepEqual(restartLines(sc), []);
+  assert.match(r.stdout, /upstream quota/);
+});
+
+test("--signals exits 0 with nothing to do and never probes", async () => {
+  const sc = newScenario({ count: 4 });
+  await startRelays(sc);
+  seedCleanState(sc);
+  fs.writeFileSync(sc.signalFile, JSON.stringify({ signals: [] }));
+  const r = await runOnce(sc, {}, ["--signals"]);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.deepEqual(restartLines(sc), []);
+  assert.deepEqual(touchedRelays(sc), []);
+});
+
+test("--signals ignores a record older than the relay's last rotation", async () => {
+  const sc = newScenario({ count: 4 });
+  await startRelays(sc);
+  const relays = {};
+  for (let i = 1; i <= 4; i++) {
+    relays[String(i)] = entry({
+      lastProbe: Date.now(), lastClean: Date.now(),
+      lastRotate: Date.now() - 1_000,
+      dirty: false,
+    });
+  }
+  writeStateFile(sc, relays);
+  fs.writeFileSync(sc.signalFile, JSON.stringify({
+    signals: [{ ts: Date.now() - 60_000, relay: 2, model: "model-a", status: 429, retryAfter: null }],
+  }));
+  const r = await runOnce(sc, {}, ["--signals"]);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.deepEqual(restartLines(sc), []);
+});

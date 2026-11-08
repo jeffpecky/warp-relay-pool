@@ -164,19 +164,21 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--fresh-ip-sweep|--reset-until-clean] [--help]
+const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--signals|--fresh-ip-sweep|--reset-until-clean] [--help]
 
   --sweep            full-pool scan + rotate every rate-limited relay until clean
                      (what the systemd timer runs)
   --once             incremental pass: probe only suspects + audit sample
   --loop             incremental pass every INTERVAL_S seconds (foreground)
   --probe            read-only per-relay probe report (no rotation, no state writes)
+  --signals          act only on LIVE_SIGNAL_FILE records: no probes, no audit
+                     sample, no state scan (minute-granularity repair)
   --fresh-ip-sweep   full-pool tier-2 re-key + fresh IP verification + probe sweep
   --reset-until-clean smart targeted full reset of rate-limited relays until 200 OK
   --help             print this text and exit`;
 
 const argv = process.argv.slice(2);
-const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
+const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--signals", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
 if (unknownArgs.length) {
  console.error(`keep-cold: unknown argument(s): ${unknownArgs.join(" ")}`);
  console.error(USAGE);
@@ -192,10 +194,11 @@ const RESET_UNTIL_CLEAN = argv.includes("--reset-until-clean");
 const SWEEP = argv.includes("--sweep");
 const LOOP = argv.includes("--loop");
 const ONCE = argv.includes("--once");
+const SIGNALS = argv.includes("--signals");
 
-const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP].filter(Boolean);
+const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP, SIGNALS].filter(Boolean);
 if (modeFlags.length > 1) {
- console.error("keep-cold: --sweep, --once, --loop, --probe, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
+ console.error("keep-cold: --sweep, --once, --loop, --probe, --signals, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
  process.exit(2);
 }
 
@@ -2300,9 +2303,105 @@ async function pass() {
  return dirty.size === 0;
 }
 
+// ── Signals-only pass ───────────────────────────────────────────────
+/**
+ * Act on LIVE_SIGNAL_FILE records and nothing else: no probes, no audit
+ * sample, no state scan. `pass()` can do this too, but only when
+ * LIVE_SIGNALS=1 and only alongside a probe sweep it pays for; a consumer
+ * that wants to react within a minute of a live 429 cannot afford that sweep.
+ * Reads the file unconditionally — the flag exists for this mode.
+ *
+ * Exit 0 only when nothing is left dirty, matching `pass()`.
+ */
+async function signalsPass() {
+ passBrokenStateLogged = false;
+ passWriteFailureLogged = false;
+
+ const state = loadState();
+ const dirty = new Set();
+ for (let i = 1; i <= COUNT; i++) if (relayEntry(state, i).dirty) dirty.add(i);
+
+ // Same 900 s history window pass() uses: a model already throttled on a
+ // guard's worth of relays is upstream quota, and restarting the one relay
+ // this record names would be exactly the churn the guard exists to stop.
+ const history429 = new Map();
+ for (let i = 1; i <= COUNT; i++) {
+  const e = relayEntry(state, i);
+  if (!e.last429.model) continue;
+  if (now() - e.last429.ts > 900_000) continue;
+  history429.set(e.last429.model, (history429.get(e.last429.model) ?? 0) + 1);
+ }
+ const quotaCapped = new Set();
+ for (const [model, n] of history429) {
+  if (n < GLOBAL_QUOTA_GUARD) continue;
+  quotaCapped.add(model);
+  log(`${model} throttled on ${n}/${COUNT} relays — upstream quota, skipping rotation for it this pass`);
+ }
+
+ const ctx = {
+  state,
+  dirty,
+  quotaCapped,
+  serverErrCapped: new Set(),
+  rotations: [],
+  hotRelays: new Map(),
+  seRelays: new Map(),
+  cappedOnly: [],
+ };
+
+ const signals = readSignals();
+ const records = signals ?? [];
+ for (const sig of [...records].sort((a, b) => a.relay - b.relay)) {
+  const index = sig.relay;
+  const entry = relayEntry(state, index);
+  // A record older than the relay's own restart describes an egress that no
+  // longer exists.
+  if (!Number.isFinite(Number(sig.ts)) || Number(sig.ts) <= entry.lastRotate) continue;
+  if (Number(sig.status) === 429) {
+   const model = typeof sig.model === "string" ? sig.model : "";
+   // Number(null) is 0, so a numeric check — not a coercion — decides whether
+   // the upstream actually asked us to wait.
+   const retryAfter = typeof sig.retryAfter === "number" ? sig.retryAfter : NaN;
+   // A short Retry-After is the upstream asking us to wait, not to change
+   // egress: schedule the next probe and leave the container alone.
+   if (Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= 120) {
+    const at = now();
+    dirty.add(index);
+    patchRelay(state, index, {
+     dirty: true,
+     lastProbe: at,
+     pendingVerify: false,
+     probeAfter: at + retryAfter * 1000,
+     consecutiveFailures: entry.consecutiveFailures + 1,
+     last429: { model, ts: at },
+    });
+    log(`#${index} retry-after ${retryAfter}s — scheduling, no restart`);
+    continue;
+   }
+   classifySignal(index, model, ctx);
+  } else {
+   patchRelay(state, index, cleanPatch());
+   dirty.delete(index);
+  }
+ }
+
+ if (ctx.cappedOnly.length) {
+  log(`throttled only on quota-capped models (left alone): ${ctx.cappedOnly.sort((a, b) => a - b).map((i) => `#${i}`).join(" ")}`);
+ }
+
+ await runPool(ctx.rotations, ROTATE_CONCURRENCY, (job) => runRotation(job, state, dirty));
+
+ if (dirty.size === 0) log("pool is cold");
+ else log(`pool is not cold: ${dirty.size} relay(s) held or throttled`);
+ return dirty.size === 0;
+}
+
 // ── Entry point ─────────────────────────────────────────────────────
 if (PROBE_ONLY) {
  const ok = await probePool();
+ process.exitCode = ok ? 0 : 1;
+} else if (SIGNALS) {
+ const ok = await signalsPass();
  process.exitCode = ok ? 0 : 1;
 } else if (SWEEP) {
  const ok = await sweep();
