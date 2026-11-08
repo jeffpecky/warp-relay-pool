@@ -34,8 +34,9 @@ Environment=KEEP_COLD_LOG=/opt/warp-relay-pool/keep-cold.log
 # probes nonexistent relays. The wizard (setup.sh) rewrites this line to the
 # actual count; edit it if you install the unit by hand.
 Environment=COUNT=10
-# Base port of the relay listeners (relay N listens on BASE_PORT+N). Must
-# match the generated compose; the wizard rewrites it from .env/default.
+# Base port of the relay listener (one port serves the whole pool; the probe
+# names its lane in a header). Must match the generated compose; the wizard
+# rewrites it from .env/default.
 Environment=BASE_PORT=3000
 # Direct public-IP ingress: the prober must present the Basic proxy
 # credentials (setup.sh rewrites this line; empty in mesh/tunnels installs).

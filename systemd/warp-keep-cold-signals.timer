@@ -1,0 +1,18 @@
+# Install alongside warp-keep-cold-signals.service (see its header), then:
+# systemctl daemon-reload && systemctl enable --now warp-keep-cold-signals.timer
+
+[Unit]
+Description=Consume relay 429 signals every minute
+
+[Timer]
+OnBootSec=2min
+# One minute: a 429 signal is only worth acting on while the throttle is fresh,
+# and the pass never probes, so a fire costs one signal-file read plus the
+# rotations it names. flock in the service turns a fire that overlaps the full
+# sweep into a skip, never a second concurrent pass.
+OnCalendar=*:0/1
+AccuracySec=5s
+Unit=warp-keep-cold-signals.service
+
+[Install]
+WantedBy=timers.target

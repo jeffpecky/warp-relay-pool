@@ -1,0 +1,40 @@
+# Install (Docker Linux host):
+#   1. Copy this file to /etc/systemd/system/warp-keep-cold-signals.service
+#      (and .timer alongside it).
+#   2. Edit the User=/Group=/WorkingDirectory=/Environment=/ExecStart=
+#      paths below. Defaults assume the repo lives at
+#      /opt/warp-relay-pool — adjust if you cloned it elsewhere.
+#   3. systemctl daemon-reload && systemctl enable --now warp-keep-cold-signals.timer
+# Template note: for a user instance (systemd --user), replace User=/Group=
+# with User=%i as warp-keep-cold.service does.
+[Unit]
+Description=Consume relay 429 signals and rotate the named egress
+Documentation=file:/opt/warp-relay-pool/keep-cold.mjs
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Edit to the user that owns the checkout (required for system units).
+User=warp-relay
+Group=warp-relay
+# The signals pass shells out to `docker restart` for every rotation.
+SupplementaryGroups=docker
+WorkingDirectory=/opt/warp-relay-pool
+# One pass reads the signal file and rotates the relays it names; it never
+# probes, so it is bounded by the rotations themselves, not by pool size.
+TimeoutStartSec=900
+# Pool size: the named relays must exist for a rotation to land.
+Environment=COUNT=10
+# The single relay port keep-cold reports through (also its probe target in
+# the full sweep). Must match the generated compose.
+Environment=BASE_PORT=3000
+# Direct public-IP ingress: the prober must present the Basic proxy
+# credentials (setup.sh rewrites this line; empty in mesh/tunnels installs).
+Environment=RELAY_PROXY_AUTH=
+# -E 0: a skipped pass (the sweep holds the lock) is contention, not failure.
+# The shared lock makes a signals pass and a full sweep mutually exclusive,
+# so a sweep never rotates a relay out from under a signal mid-pass.
+ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock /usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --signals
+StandardOutput=journal
+StandardError=journal
