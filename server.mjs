@@ -387,9 +387,11 @@ const server = http.createServer(async (req, res) => {
     // endpoint that 503s when every lane is cooled would make every probe
     // fail, which marks every lane sick — and a sick lane is only cleared by
     // a probe that needs a usable lane. Answering here is what lets a cooled
-    // or sick fleet recover. (Task 7 makes this honor x-relay-lane, so each
-    // lane's probe reaches that lane.)
-    const lane = lanes.pick(key) || lanes.lanes[0];
+    // or sick fleet recover.
+    // Task 7 inserts the pin HERE, above the pick: a probe naming lane N must
+    // reach lane N, or a dead lane reads healthy forever.
+    const pinned = null;
+    const lane = pinned || lanes.pick(key) || lanes.lanes[0];
     try {
       const trace = await fetch("https://cloudflare.com/cdn-cgi/trace", {
         dispatcher: lane.agent,
