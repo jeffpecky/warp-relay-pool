@@ -99,13 +99,17 @@ test("a failing probe marks the lane sick and parks it", async () => {
 
 test("a passing probe clears only its own lane", async () => {
   const p = pool(2, { probe: async (l) => l.n === 1, probeIntervalMs: 5 });
+  // Start from a parked lane so "cleared" can only come from the probe passing.
+  p.lanes[0].sick = true;
+  p.lanes[0].probeOutUntil = Date.now() + 60_000;
   p.lanes[0].cool429Until = Date.now() + 60_000;
   p.start();
   try {
     await new Promise((r) => setTimeout(r, 80));
-    assert.equal(p.lanes[0].sick, false);
-    assert.equal(p.lanes[0].probeOutUntil, 0);
+    assert.equal(p.lanes[0].sick, false, "the pass re-admits the lane");
+    assert.equal(p.lanes[0].probeOutUntil, 0, "the pass clears the probe cooldown");
     assert.ok(p.lanes[0].cool429Until > Date.now() + 50_000, "the 429 lane survives a passing probe");
+    assert.equal(p.lanes[1].sick, true, "the failing lane is untouched by lane 1's pass");
   } finally {
     p.stop();
   }
