@@ -30,6 +30,7 @@ jobs:
       - name: JS syntax check
         run: |
           node --check server.mjs
+          node --check router.mjs
           node --check keep-cold.mjs
 
       # On this runner /bin/sh is dash, so `sh -n` doubles as the POSIX gate.

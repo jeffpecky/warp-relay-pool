@@ -28,12 +28,12 @@ const SUF_BASE = BASE + 20;
 const RE_BASE = BASE + 30;
 const CLOSED_BASE = BASE + 40;
 const FAILCLOSED_BASE = BASE + 50;
-const EXACT_PORT = EXACT_BASE + 1;
-const WILD_PORT = WILD_BASE + 1;
-const SUF_PORT = SUF_BASE + 1;
-const RE_PORT = RE_BASE + 1;
-const CLOSED_PORT = CLOSED_BASE + 1;
-const FAILCLOSED_PORT = FAILCLOSED_BASE + 1;
+const EXACT_PORT = EXACT_BASE;
+const WILD_PORT = WILD_BASE;
+const SUF_PORT = SUF_BASE;
+const RE_PORT = RE_BASE;
+const CLOSED_PORT = CLOSED_BASE;
+const FAILCLOSED_PORT = FAILCLOSED_BASE;
 const TOKEN = "test-token-123";
 
 const CONNECTS = [];
@@ -136,9 +136,10 @@ function spawnRelay(basePort, allowlist, token) {
     // Explicit empty string (not inherit) so no-token relays deterministically
     // exercise the fail-closed path even if the parent env sets a token.
     RELAY_AUTH_TOKEN: token || "",
-    // The mux is out of scope for this harness: its immediate health probe
-    // walks the real egress path and would pollute the CONNECT ledger.
-    RELAY_MUX: "0",
+    // No probes: probe traffic would pollute the CONNECT ledger, and a retry
+    // would multiply the records these tests count.
+    RELAY_LANE_PROBE_S: "0",
+    RELAY_LANE_RETRY_MAX: "0",
   };
   const child = spawn(process.execPath, ["server.mjs"], {
     cwd: REPO_ROOT,
@@ -255,7 +256,7 @@ before(async () => {
   await spawnRelay(WILD_BASE, "*", TOKEN);
   await spawnRelay(SUF_BASE, "*.example.com", TOKEN);
   await spawnRelay(RE_BASE, "re:^http://.*\\.example\\.com$", TOKEN);
-  // Closed-mode: exact origins only, no token configured — the pi-freeflow
+  // Closed-mode: exact origins only, no token configured — the closed-mode
   // default. Also carries https://example.com so CONNECT exact-exempt has a
   // hostname target without needing another relay.
   await spawnRelay(CLOSED_BASE, `${exactTarget},https://example.com`, "");
@@ -417,7 +418,7 @@ test("upstream redirects are not followed", async () => {
   assert.equal(secondHits, before);
 });
 
-test("closed-mode exact without any token stays usable (pi-freeflow default)", async () => {
+test("closed-mode exact without any token stays usable (closed-mode default)", async () => {
   const target = `http://127.0.0.1:${upstream.address().port}`;
   const before = CONNECTS.length;
   const res = await get(CLOSED_PORT, { target });

@@ -15,10 +15,10 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
-// Disjoint from relay-guard (23000-24099), keep-cold (25000-25999), mux
-// (26000-262xx), universal-proxy (27000-275xx).
+// Disjoint from relay-guard (23000-24099), keep-cold (25000-25999),
+// universal-proxy (27000-275xx).
 const BASE = 28400 + Math.floor(Math.random() * 100);
-const RELAY_PORT = BASE + 1;
+const RELAY_PORT = BASE;
 const CRED = "runner:opardmpl";
 const TOKEN = Buffer.from(CRED).toString("base64");
 
@@ -35,9 +35,9 @@ before(async () => {
       // credential itself is what server.mjs reads.
       RELAY_PROXY_AUTH: CRED,
       RELAY_ALLOWED_TARGETS: "https://opencode.ai",
-      // Mux out of scope: its health probe walks the (here dead) egress path
-      // and would only add log noise.
-      RELAY_MUX: "0",
+      // No probes: the lane points at a closed port, so a probe would park it
+      // before the tests run and every dispatch would 503 instead of 502.
+      RELAY_LANE_PROBE_S: "0",
       WARP_HOST_1: "127.0.0.1",
       WARP_PORT_1: "1", // closed port: dispatch gives 502
     },
