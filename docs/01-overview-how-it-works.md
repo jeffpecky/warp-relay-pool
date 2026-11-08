@@ -1,56 +1,59 @@
 # 01 — Overview: how it works
 
-One stack, two modes — see [README track
-routing](../README.md#which-track-am-i-60s): Track A (independent universal
-proxy, any upstream via allowlist + token —
-[06-universal-proxy.md](06-universal-proxy.md)) and Track B (specialized
-pi-freeflow pool for OMP/Pi —
-[03-use-with-pi-freeflow.md](03-use-with-pi-freeflow.md)). This page
-describes the shared request path both tracks ride.
+One stack, one client URL. N isolated Cloudflare WARP egress addresses are
+fronted by a single L7 relay router: it parses each HTTP request, picks a lane,
+and forwards through that lane's SOCKS proxy. Every lane is also a WARP client
+container with its own egress, so a 429 throttles one egress, not the pool.
 
-Self-hosted Docker/WARP alternative to the Workers/Deno/Vercel relays
+Self-hosted Docker/WARP alternative to the Workers/Deno/Vercel relays that
 [pi-freeflow](https://github.com/trefeon/pi-freeflow)'s `/freeflow deploy`
-creates — the OMP/Pi extension (npm `pi-freeflow`): same
-`x-relay-target`/`x-relay-path` protocol, same allowlist
+creates. Same `x-relay-target`/`x-relay-path` protocol, same default allowlist
 (`https://opencode.ai`, `https://api.kilo.ai`,
-`https://oai.endpoints.kepler.ai.cloud.ovh.net`). Client-side failover lives
-there — see its [relays.md failover table](https://github.com/trefeon/pi-freeflow/blob/main/docs/pages/relays.md);
-this repo documents the relay side only, not its model catalog.
-One `relay` process exposes N listeners (`BASE_PORT+N`, default `3001`–`3000+N`).
-Each listener forwards through its own MicroWARP client's SOCKS proxy
-(`warp-N:1080`, ~1.8 MiB RAM each) and is reachable two ways:
-
-1. **TryCloudflare Quick Tunnels (`--with-tunnels`):** Each relay is exposed as a public HTTPS URL (`https://<hash>.trycloudflare.com`). Zero configuration required—no Cloudflare account, domain, or client-side VPN needed.
-2. **Mesh-VPN Direct (Tailscale):** Static private URLs (`http://<tailscale-ip>:310N`) published directly over an encrypted WireGuard mesh network.
+`https://oai.endpoints.kepler.ai.cloud.ovh.net`), but one URL instead of one
+per relay. This repo documents the relay side only.
 
 ```
-[any HTTP client via universal mode] ──┐
-                                       ├──► https://<hash>.trycloudflare.com (TryCloudflare, public HTTPS)
-[OMP/Pi via pi-freeflow] ──────────────┘ └─► http://<tailscale-ip>:310N      (Mesh-VPN, static private)
-      ──► [relay :300N] ──► [MicroWARP SOCKS :1080] ──► [upstream API, egress <EGRESS-IP>]
+[any HTTP client] ──► http://<router>:3100 ──► lane pick ──► [MicroWARP SOCKS :1080]
+                                                  │              (Alpine WireGuard + microsocks,
+                                                  │               ~1.8 MiB RAM each)
+                                                  ▼
+                                          warp-1 .. warp-N  ──► [upstream API, egress <EGRESS-IP>]
 ```
+
+Reachable two ways:
+
+1. **TryCloudflare Quick Tunnels (`--with-tunnels`):** one `tunnel-0` container
+   fronts the router at a public HTTPS URL (`https://<hash>.trycloudflare.com`).
+   Zero configuration — no Cloudflare account, domain, or client VPN.
+2. **Mesh-VPN Direct (Tailscale):** `http://<tailscale-ip>:3100` published
+   directly over an encrypted WireGuard mesh. The wizard binds it to the tailnet
+   address.
 
 ## Request lifecycle
 
-1. Client sends the request to the relay URL with two headers
-   (`server.mjs`: `x-relay-target`, `x-relay-path`).
-2. Relay strips those headers (plus `host`), forwards
-   `method + headers + body` to `target + relayPath` via that relay's
-   own `ProxyAgent` dispatcher (`undici`), 5-minute cap
-   (`AbortSignal.timeout(300000)`), client-disconnect abort wiring.
-3. Relay answers with `cache-control: no-cache`,
-   `x-accel-buffering: no`, upstream `content-type` only, `flushHeaders()`
-   before the first body byte, then `pipeline(Readable.fromWeb(body), res)`
-   — SSE tokens stream, nothing buffers. See `server.mjs`.
-4. No `x-relay-target` header = health check: relay fetches
-   `https://cloudflare.com/cdn-cgi/trace` through its own dispatcher and
-   returns `Relay #N OK (via socks5://warp-N:1080)` plus the trace body.
-   A per-relay egress proof, not a load-balancer ping.
-5. Target not in the allowlist (`RELAY_ALLOWED_TARGETS`, default
-   `https://opencode.ai`, `https://api.kilo.ai`,
-   `https://oai.endpoints.kepler.ai.cloud.ovh.net`) = `403 {"error":"Forbidden target"}`.
-   The allowlist covers every hop: upstream `3xx` redirects are refused
-   (`502`), so an allowlisted origin cannot steer the relay elsewhere.
+1. **One listener.** `server.mjs` accepts the request on `BASE_PORT` (container
+   `3000`, host `3100`). There is exactly one, for every lane.
+2. **Lane pick.** `router.mjs` derives a stickiness key from the session headers
+   (falling back to the peer address), then picks the lane already bound to that
+   key if it is usable; otherwise it round-robins to the next usable lane.
+   "Usable" = not sick, past its probe cooldown, past any 429 cooldown.
+3. **Allowlist.** The target origin — from `x-relay-target`, or from an
+   absolute request URI — must match `RELAY_ALLOWED_TARGETS`. A wildcard match
+   additionally requires `x-relay-auth`. Anything else is `403`.
+4. **Replayable buffer.** The request body is buffered up to
+   `RELAY_LANE_RETRY_MAX_BODY` (default 1 MiB) so a retry can replay it. A
+   larger body streams and is never retried.
+5. **Attempt loop.** Forward through the lane's `ProxyAgent` dispatcher
+   (`undici`, 5-minute cap, client-disconnect abort wiring). A connect failure,
+   a `429`, or a `502`/`503`/`504` on a `GET`/`HEAD` retries on another lane,
+   up to `RELAY_LANE_RETRY_MAX` extra attempts.
+6. **Stream out.** `cache-control: no-cache`, `x-accel-buffering: no`, upstream
+   `content-type` only, `flushHeaders()` before the first body byte, then
+   `pipeline(Readable.fromWeb(body), res)` — SSE tokens stream, nothing buffers.
+
+No `x-relay-target` header = health check: the relay fetches
+`https://cloudflare.com/cdn-cgi/trace` through its lane and returns the trace
+body, a per-egress proof rather than a load-balancer ping.
 
 ## Header protocol
 
@@ -58,46 +61,47 @@ Each listener forwards through its own MicroWARP client's SOCKS proxy
 | --- | --- | --- |
 | `x-relay-target` | no | Upstream origin, trailing `/` stripped. Absent = health check. |
 | `x-relay-path` | no | Path appended to target. Default `/`. |
+| `x-relay-auth` | wildcard only | Token for a wildcard/suffix/regex allowlist match. Stripped, never forwarded. |
+| `x-relay-lane` | no | Keep-cold only. Pins the lane a probe measures; ignored without `x-keep-cold-probe`. |
+| `x-opencode-session` | no | Stickiness key, with `x-session-affinity` / `x-session-id` as fallbacks. |
 
-Minimal forward example (relay 1 on its bridge address):
+Minimal forward example:
 
 ```bash
-curl -s -N http://10.244.0.100:3001/v1/models \
+curl -s -N http://<router>:3100/v1/models \
   -H "x-relay-target: https://opencode.ai" \
   -H "x-relay-path: /zen/v1/models"
 ```
 
-## Ingress options: TryCloudflare Quick Tunnels vs Mesh-VPN
+## Why one URL (not one port per relay)
 
-### 1. TryCloudflare Quick Tunnels (`--with-tunnels`): Recommended for Easiest Setup
+An earlier design gave each relay its own listener and left the client to
+choose — the pi-freeflow model, where the extension held a relay list and
+raced them. That put routing knowledge in every client. One URL moves it into the
+router, which can see things a client cannot: a lane's last probe result, its
+429 cooldown, and the egress the previous turn actually used.
 
-Running `./generate-compose.sh N --with-tunnels` pairs each relay port (`300N`) with a lightweight `cloudflare/cloudflared:latest` container (~18–20 MiB RAM).
-- **Zero configuration:** No Cloudflare account, custom domain, API token, or router port-forwarding needed. Cloudflare automatically issues a secure public HTTPS URL ending in `.trycloudflare.com`.
-- **Security allowlist:** Although the tunnel URLs are public, the relay router strictly rejects any request whose target is not in `RELAY_ALLOWED_TARGETS` (`opencode.ai`, `api.kilo.ai`, `oai.endpoints.kepler.ai.cloud.ovh.net`) with `HTTP 403 Forbidden`.
-- **URL stability:** Tunnels run as independent sibling containers. Rebuilding the relay app or restarting WARP clients (for 429 rotation) does **not** restart the tunnels or change their URLs.
-
-### 2. Mesh-VPN Direct (Tailscale)
-
-The `relay` service publishes `${INGRESS_BIND}:3101-<3100+N>` → container `3001-<3000+N>`, so `http://<tailscale-ip>:310N` reaches relay `:300N` over your private encrypted Tailscale network. `INGRESS_BIND` defaults to `127.0.0.1`; the wizard (`setup.sh`) sets it to the VPS Tailscale IP for mesh installs, and manual installs pass it explicitly (`INGRESS_BIND=<tailscale-ip> ./generate-compose.sh N`).
-- **Static:** URLs never change across container recreations, host reboots, or updates.
-- **Private:** No traffic passes over public tunnel endpoints.
-## Why one port per relay (not a single load balancer)
-
-- **Reasoning-issuer affinity:** reasoning models return encrypted
-  reasoning decryptable only by the issuing egress IP. The client pins
-  follow-up turns to the issuing relay; a blind load balancer would route
-  turn 2 to a different egress and break the conversation.
-- **Failure isolation:** one hot egress cools down one relay while the
-  rest keep serving — behind one endpoint, a single 429 poisons everything.
-- **Hedging:** the client can race a stalled relay against a second egress
-  path; a single endpoint gives it nothing to race with.
+- **Reasoning-issuer affinity** is preserved by **session stickiness**, not by
+  a client-side pin. Reasoning models return encrypted reasoning decryptable
+  only by the issuing egress; the router keeps a session on one lane with no
+  TTL, so turn 2 reaches the egress that issued turn 1. Conflict with
+  failover is resolved in favour of staying alive: a lane that 429s is cooled
+  and the session moves to a sibling.
+- **Per-request failover.** A `429` or a dead connect retries inside the pool,
+  so a single hot egress no longer means a client-visible error.
+- **One capability to hand out.** One URL is one secret, one firewall rule, one
+  thing to paste. Per-relay URLs made rotation a client-config change.
+- **A `CONNECT` tunnel is the exception.** It splices a raw byte pipe for the
+  life of the connection, so it occupies one egress for that life. That is the
+  protocol, not a routing decision.
 
 ## Why per-relay WARP egress
 
-Each `warp-N` (minimal MicroWARP `warp-lite:latest`, `NET_ADMIN`) owns its
-IPv6 egress `/128`, so upstream per-IP throttling (HTTP 429) hits one relay,
-not the pool. IPv4 egress is Cloudflare CGNAT, shared across the pool; an
-IPv4-only upstream can therefore throttle several relays at once, which is
-what `GLOBAL_QUOTA_GUARD` and the duplicate-IP note in `get-status.sh` are
-for. Rotating one `warp-N` buys a fresh egress address while every client
-URL keeps working. That isolation is the whole pool design.
+Each `warp-N` (minimal MicroWARP `warp-lite:latest`, `NET_ADMIN`) owns its IPv6
+egress `/128`, so upstream per-IP throttling (HTTP 429) hits one lane, not the
+pool. IPv4 egress is Cloudflare CGNAT, shared across the pool; an IPv4-only
+upstream can therefore throttle several lanes at once, which is what
+`GLOBAL_QUOTA_GUARD` and the duplicate-IP note in `get-status.sh` are for.
+Rotating one `warp-N` buys a fresh egress address while the client URL keeps
+working. That isolation is the whole pool design, and it is why the router is
+worth having: only one component needs to know which lanes are healthy.

@@ -42,17 +42,17 @@ default: nothing is reachable from the internet unless you opt in.
   Expose deliberately with `WARP_BIND=0.0.0.0` (or an interface address)
   at generation time; when exposed, keep it on loopback, your Tailscale
   interface, or a trusted network — never the open internet.
-- `3100+N` → relay router (mesh-VPN ingress), published only in mesh mode;
+- `3100` → relay router (mesh-VPN ingress), published only in mesh mode;
   `setup.sh` sets `INGRESS_BIND` to the VPS Tailscale IP. In tunnels mode
-  it is not host-published at all — tunnels reach it in-network at
-  `http://10.244.0.100:300N`.
+  it is not host-published at all — `tunnel-0` reaches it in-network at
+  `http://10.244.0.100:3000`.
 - **Direct public-IP ingress (`RELAY_DIRECT_PUBLIC=1`)** publishes the
-  router range on `0.0.0.0`, so the generator refuses to write the file
+  router on `0.0.0.0`, so the generator refuses to write the file
   unless `RELAY_PROXY_AUTH=user:pass` is set. Every dispatched request and
   CONNECT then requires HTTP Basic `Proxy-Authorization` (`407` +
   challenge otherwise) — exact-origin allowlist hits included; only the
   no-target health path is exempt. Treat the printed
-  `http://user:pass@<public-ip>:310N` client lines as secrets: anyone
+  `http://user:pass@<public-ip>:3100` client line as a secret: anyone
   holding that string shares the pool's egresses (same capability model
   as tunnel URLs). Raw WARP SOCKS ports stay loopback-bound in this mode.
 

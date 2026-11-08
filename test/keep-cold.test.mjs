@@ -18,17 +18,13 @@ import { spawn } from "node:child_process";
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 
 // Node --test runs test files in parallel: relay-guard.test.mjs owns
-// 23000-23999, this file takes fresh 64-port blocks from 25000-25999 and never
-// reuses one.
+// 23000-23999, this file owns 25000-26999 and never reuses a block. The start
+// is fixed rather than random: the band is this file's alone, and a random
+// start only ever bought a run that occasionally reserved too little of it.
 const PORT_MIN = 25000;
 const PORT_MAX = 26999;
 const PORT_BLOCK = 32;
-// Behaviour scenarios that bind relays: keep this in step with the tests below
-// so the random start always leaves room for every block. One listener now
-// serves the whole pool, so a scenario takes one block regardless of COUNT.
-const SCENARIO_BLOCKS = 52;
-let nextBlock = PORT_MIN
- + Math.floor(Math.random() * Math.max(1, PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
+let nextBlock = PORT_MIN;
 
 const servers = [];
 const tmpDirs = [];

@@ -1,6 +1,6 @@
 // Lane pool for the single-URL L7 router: picks which relay egress serves a
-// request, keeps session stickiness, and owns the two-lane cooldown model
-// lifted from mux.mjs (probeOutUntil vs cool429Until).
+// request, keeps session stickiness, and owns the two-cooldown model:
+// probeOutUntil (a failed probe) vs cool429Until (a 429 signal).
 //
 // - sticky: LANE key -> lane, no TTL, LRU-capped at stickyMax. Session
 //   headers beat the peer address so one client keeps one /64.

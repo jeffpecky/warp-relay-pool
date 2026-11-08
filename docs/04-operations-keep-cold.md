@@ -253,10 +253,10 @@ to a baseline sweep, and the exit status is unaffected.
 ## Warp-only rule
 
 `docker restart warp-relay-warp-N` (or `docker compose restart warp-N`) is
-the only rotation action. Never restart `tunnel-N` or `relay`
-for a hot egress: tunnel restarts mint new `*.trycloudflare.com` URLs
-(breaking every pasted `/freeflow add` line) and relay restarts drop all
-ten listeners for nothing.
+the only rotation action. Never restart `tunnel-0` or `relay` for a hot
+egress: a tunnel restart mints a new `*.trycloudflare.com` URL (breaking the
+one URL every client uses) and a relay restart drops every in-flight
+connection across the pool for nothing.
 
 ## Logs
 
