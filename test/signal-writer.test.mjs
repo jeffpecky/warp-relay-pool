@@ -229,6 +229,33 @@ test("an unwritable path never throws and logs at most one line", () => {
   }
 });
 
+test("a flush colliding with an open reader still lands", async () => {
+  // Windows fails rename-over-existing with EPERM while another handle holds
+  // the target open, and keep-cold polls this file constantly. The writer must
+  // retry instead of stranding the record until the next 429.
+  const { file, dir } = tmpFile();
+  const writer = createSignalWriter({ file, flushMs: 5, log: silent });
+  try {
+    writer.record({ relay: 1, model: "m", status: 429 });
+    writer.flush();
+
+    const held = fs.openSync(file, "r");
+    writer.record({ relay: 1, model: "m", status: 200 });
+    writer.flush();
+    // Hold long enough to collide with the first attempt, then let the retry
+    // land (POSIX ignores the lock, Windows does not).
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    fs.closeSync(held);
+    const deadline = Date.now() + 5_000;
+    while (readSignals(file).length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(readSignals(file).map((s) => s.status), [429, 200]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("a record schedules one coalesced flush", async () => {
   const { file, dir } = tmpFile();
   const writer = createSignalWriter({ file, flushMs: 20, log: silent });

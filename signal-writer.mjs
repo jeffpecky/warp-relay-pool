@@ -11,6 +11,9 @@ import path from "node:path";
 
 const THROTTLE = 429;
 const RECOVERY = 200;
+// Windows refuses to rename over a file another handle holds open.
+const RETRYABLE = new Set(["EPERM", "EBUSY", "EACCES"]);
+const MAX_RETRIES = 5;
 
 export function createSignalWriter({
   file,
@@ -32,6 +35,7 @@ export function createSignalWriter({
   const pending = [];
   const throttled = new Map();
   let timer = null;
+  let retries = 0;
   let loggedFailure = false;
 
   function logFailure(err) {
@@ -58,12 +62,12 @@ export function createSignalWriter({
     }
   }
 
-  function schedule() {
+  function schedule(delayMs = delay) {
     if (timer !== null) return;
     timer = setTimeout(() => {
       timer = null;
       flush();
-    }, delay);
+    }, delayMs);
     timer.unref?.();
   }
 
@@ -87,8 +91,19 @@ export function createSignalWriter({
       fs.writeFileSync(tmp, `${JSON.stringify({ signals: records })}\n`);
       fs.renameSync(tmp, target);
       pending.length = 0;
+      retries = 0;
     } catch (err) {
+      // A reader holding the target open makes rename fail on Windows
+      // (EPERM/EBUSY/EACCES). keep-cold polls this file, so that is the normal
+      // case, not an error: retry briefly before logging, or one unlucky
+      // rename would strand the record until the next 429.
+      if (RETRYABLE.has(err?.code) && retries < MAX_RETRIES) {
+        retries += 1;
+        schedule(delay + retries * 100);
+        return;
+      }
       logFailure(err);
+      retries = 0;
       // Keep `pending` (bounded by `limit`) so a later flush can still land
       // it; no retry loop of our own.
       try {
