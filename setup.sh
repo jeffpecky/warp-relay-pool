@@ -212,13 +212,13 @@ if ! docker info >/dev/null 2>&1; then
 fi
 log_ok "Docker and Docker Compose verified ($DOCKER_COMPOSE)."
 
-# Auto-install Node.js if missing (for keep-cold rotation prober)
+# Auto-install Node.js if missing (keep-cold controller: lane rotation + liveness sweep)
 NODE_BIN="$(command -v node 2>/dev/null || true)"
 if [ -z "$NODE_BIN" ]; then
-  log_warn "Node.js (>=18) is needed for the keep-cold auto-rotation prober."
+  log_warn "Node.js (>=18) is needed for the keep-cold controller (restarts lanes reported as rate-limited, plus the liveness sweep)."
   DO_INSTALL_NODE=true
   if [ "$AUTO_YES" != true ]; then
-    printf "Install Node.js on the VPS for rate-limit auto-rotation? [Y/n]: "
+    printf "Install Node.js on the VPS for the keep-cold controller (lane rotation + liveness sweep)? [Y/n]: "
     read -r ans || true
     case "$ans" in
       [nN]*) DO_INSTALL_NODE=false ;;
@@ -708,13 +708,12 @@ NODE_MAJOR=0
 if [ -n "$NODE_BIN" ]; then
   NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
 fi
-# A full sweep probes every relay and rotates each throttled one until it
-# streams again. At 20 relays a throttled round realistically needs more than
-# 5 minutes, so the timer period is sized to the pool: 5 minutes up to 10
-# relays, 15 minutes above that. flock -n still skips a fire that arrives while
-# the previous sweep is running. The 2-minute default for small pools keeps
-# repair latency tight; incremental passes only probe suspects + the audit
-# sample, so the tick stays cheap steady-state.
+# A full sweep probes every relay for liveness and health. At 20 relays a round
+# realistically needs more than 5 minutes, so the timer period is sized to the
+# pool: 5 minutes up to 10 relays, 15 minutes above that. flock -n still skips a
+# fire that arrives while the previous sweep is running. The 2-minute default
+# for small pools keeps repair latency tight; incremental passes only probe
+# suspects + the audit sample, so the tick stays cheap steady-state.
 if [ "${SWEEP_INTERVAL_MIN:-}" = "" ]; then
   if [ "${COUNT:-5}" -gt 10 ]; then SWEEP_INTERVAL_MIN=15; else SWEEP_INTERVAL_MIN=2; fi
 fi
@@ -726,7 +725,7 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
   SETUP_SYSTEMD=true
   if [ "$AUTO_YES" != true ]; then
     echo ""
-    printf "Enable keep-cold + logwatch timers to auto-rotate rate-limited (429) relays? [Y/n]: "
+    printf "Enable the keep-cold signal watcher + liveness sweep and the logwatch timer? [Y/n]: "
     read -r ans || true
     case "$ans" in
       [nN]*) SETUP_SYSTEMD=false ;;
@@ -847,8 +846,9 @@ if [ -n "${RELAY_SIGNAL_TOKEN:-}" ]; then
   echo ""
 else
   echo "Client 429 reporting is OFF: no RELAY_SIGNAL_TOKEN was minted (it needs"
-  echo "   proxy auth, so tunnels mode has none). 429s will rotate on the sweep"
-  echo "   timer only. To turn it on: add RELAY_SIGNAL_TOKEN=$(gen_pass) to .env,"
+  echo "   proxy auth, so tunnels mode has none). Nothing will rotate a throttled"
+  echo "   lane, because 429 is the client's verdict and the sweep is liveness-only."
+  echo "   To turn it on: add RELAY_SIGNAL_TOKEN=$(gen_pass) to .env,"
   echo "   re-run ./generate-compose.sh ${COUNT} && docker compose up -d, then set"
   echo "   the same token as RELAY_SIGNAL_TOKEN in zen-proxy."
   echo ""

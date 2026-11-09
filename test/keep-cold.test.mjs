@@ -437,6 +437,42 @@ test("a client-reported 429 rotates tier 1 first, tier 2 only after two failures
  );
 });
 
+// ── case 4c: a probe 429 must not poison the client's backoff ──────
+test("probe 429s do not inflate the counter the client's 429 is gated on", async () => {
+ // The sweep used to bump consecutiveFailures on every probe 429. That counter
+ // drives effectiveCooldown() and the tier-2 escalation on the signal path, so
+ // ninety sweeps of probe throttling turned the very first client report into a
+ // 3600 s lockout plus a Cloudflare registration. Probes are liveness-only; they
+ // must leave the counter exactly where they found it.
+ const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429 } } } });
+ await startRelays(sc);
+ for (let i = 0; i < 3; i++) {
+  await runOnce(sc, { KEEP_COLD_CLOCK_SKEW_S: String(i * 3600), MIN_CLEAN_COUNT: "1" }, ["--sweep"]);
+ }
+ assert.equal(readState(sc).relays["1"].consecutiveFailures, 0, "probe 429s must not count as failures");
+
+ // The first client report must get a tier-1 restart on the base cooldown.
+ fs.writeFileSync(sc.signalFile, JSON.stringify({
+  signals: [{ ts: Date.now(), relay: 1, model: "model-a", status: 429, retryAfter: null }],
+ }));
+ const r = await runOnce(sc, { KEEP_COLD_CLOCK_SKEW_S: "10800" }, ["--signals"]);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-1"]);
+ assert.doesNotMatch(
+  fs.readFileSync(sc.dockerLog, "utf8"),
+  /rm -f \/etc\/wireguard\/wg0\.conf/,
+  "the first client 429 must not spend a Cloudflare registration",
+ );
+ const st = readState(sc).relays["1"];
+ assert.equal(st.consecutiveFailures, 1);
+ // Cooldowns are stamped on the (skewed) scheduler clock, so measure against
+ // the rotation this pass recorded, not wall time.
+ assert.ok(
+  st.cooldownUntil - st.lastRotate <= 610_000,
+  `cooldown ${st.cooldownUntil - st.lastRotate}ms exceeds the base RELAY_COOLDOWN_S`,
+ );
+});
+
 // ── case 5: a probe 429 is never a rotation trigger ────────────────
 test("a probe 429 on 9 of 20 relays rotates nothing and restarts nothing", async () => {
  const throttle = {};
@@ -453,6 +489,25 @@ test("a probe 429 on 9 of 20 relays rotates nothing and restarts nothing", async
  assert.match(r.stdout, /#9 model-a 429 on probe — ignored \(client reports rate limits\)/);
  assert.match(r.stdout, /clean 11\/20 relay\(s\)/);
  assert.doesNotMatch(r.stdout, /pool is cold/);
+});
+
+test("probe 429s cannot make the quota guard veto a client's report", async () => {
+ // Nine probe 429s are not nine reports. The guard exists to stop a rotation
+ // storm on a model that the *clients* say is capped pool-wide; letting probe
+ // evidence fill that history means the prober can silently suppress the very
+ // report the client made, which is the native 429 checker surviving through
+ // the quota guard instead of the prober.
+ const throttle = {};
+ for (let i = 1; i <= 9; i++) throttle[i] = { "model-a": { status: 429 } };
+ const sc = newScenario({ count: 20, throttle });
+ await startRelays(sc);
+ fs.writeFileSync(sc.signalFile, JSON.stringify({
+  signals: [{ ts: Date.now(), relay: 10, model: "model-a", status: 429, retryAfter: null }],
+ }));
+ const r = await runOnce(sc, { LIVE_SIGNALS: "1", GLOBAL_QUOTA_GUARD: "9" }, []);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.doesNotMatch(r.stdout, /upstream quota/);
+ assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-10"]);
 });
 
 // ── case 6: settle window ──────────────────────────────────────────
@@ -489,6 +544,10 @@ test("an unreachable relay is troubled, never restarted", async () => {
  const st = readState(sc).relays["2"];
  assert.equal(st.dirty, true);
  assert.ok(st.probeAfter > Date.now() + 590_000, `probeAfter ${st.probeAfter}`);
+ // An unreachable lane is the prober's problem, not evidence for the client's
+ // failure ladder. If it bumped the counter, a healthy-then-broken lane would
+ // hand the first real client 429 a maxed-out cooldown and a tier-2 re-key.
+ assert.equal(st.consecutiveFailures, 0, "a probe health failure must not advance the client's ladder");
 });
 
 // ── case 7: a probe 429 no longer schedules anything ───────────────
@@ -1196,12 +1255,16 @@ test("--sweep does not rotate even when every relay answers 429", async () => {
   },
  });
  await startRelays(sc);
- const r = await runOnce(sc, { SWEEP_QUOTA_GUARD: "4" }, ["--sweep"]);
+ const r = await runOnce(sc, {}, ["--sweep"]);
  assert.deepEqual(restartLines(sc), [], "a fleet-wide probe 429 rotates nothing");
- assert.match(r.stdout, /pool is degraded/);
+ // A lane that answers 429 is serving: the sweep's floor is a liveness floor,
+ // and the rate-limit verdict is the client's to report. It is not degradation.
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ assert.match(r.stdout, /every lane answered 429/);
+ assert.match(r.stdout, /pool is safe/);
 });
 
-test("--sweep exits 0 when clean count meets floor even with some still throttled", async () => {
+test("--sweep still counts a probe-throttled lane as clean for its health", async () => {
  const sc = newScenario({
   count: 4,
   throttle: {
@@ -1210,7 +1273,6 @@ test("--sweep exits 0 when clean count meets floor even with some still throttle
   },
  });
  await startRelays(sc);
- // MAX_RESET_ATTEMPTS=1, relays stay throttled; floor=2 → 2 clean already OK
  const r = await runOnce(
   sc,
   { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "1", MIN_CLEAN_COUNT: "2" },
@@ -1218,27 +1280,21 @@ test("--sweep exits 0 when clean count meets floor even with some still throttle
  );
  assert.equal(r.code, 0, r.stdout + r.stderr);
  assert.match(r.stdout, /sweep result: 2\/4 relay\(s\) clean/);
+ assert.match(r.stdout, /2 rate-limited \(client's verdict\)/);
  assert.match(r.stdout, /safe floor 2/);
  assert.match(r.stdout, /pool is safe/);
 });
 
-test("--sweep exits 1 when clean count is below floor", async () => {
- const sc = newScenario({
-  count: 4,
-  throttle: {
-   1: { "model-a": { status: 429 } },
-   2: { "model-a": { status: 429 } },
-   3: { "model-a": { status: 429 } },
-  },
- });
- await startRelays(sc);
+test("--sweep counts an unreachable lane against the floor, not a throttled one", async () => {
+ const sc = newScenario({ count: 4 });
+ await startRelays(sc, { dead: [1, 2, 3] });
  const r = await runOnce(
   sc,
   { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "1", MIN_CLEAN_COUNT: "3" },
   ["--sweep"],
  );
  assert.equal(r.code, 1, r.stdout + r.stderr);
- assert.match(r.stdout, /pool is degraded/);
+ assert.match(r.stdout, /pool is degraded: 3 relay\(s\) not alive/);
 });
 
 test("--sweep never spends a Cloudflare registration on a probe 429", async () => {
@@ -1258,7 +1314,9 @@ test("--sweep never spends a Cloudflare registration on a probe 429", async () =
   },
   ["--sweep"],
  );
- assert.equal(r.code, 1, r.stdout + r.stderr);
+ // 1 clean + 1 rate-limited = 2 alive, so the floor is met; what this test
+ // guards is that a probe 429 never rotates anything.
+ assert.equal(r.code, 0, r.stdout + r.stderr);
  // The sweep's escalation machinery is intact (--reset-until-clean still
  // re-keys a stuck /64), but a sweep probes only for liveness, so this path
  // must not rotate anything — no restart, no registration. (A `docker inspect`

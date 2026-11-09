@@ -44,7 +44,7 @@ Or run non-interactively with auto-detected sizing recommendations:
 2. **Hardware Sizing:** Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot**.
 3. **MicroWARP Build:** Builds the ultra-lightweight WireGuard + microsocks engine (~1.8 MiB RAM per relay).
 4. **Ingress Wiring:** Exposes the router on a public HTTPS URL (`--with-tunnels`, no Cloudflare account or open inbound port needed) or on your Tailscale address.
-5. **Keep-Cold Timers:** Installs `warp-keep-cold.timer` — a liveness sweep every 5 minutes (≤ 10 relays) or 15 minutes (> 10) that catches dead containers and silently throttled egresses. Rate-limit verdicts come from the client, not a probe: `warp-keep-cold-signals.service` consumes a client-reported 429 the moment it lands and restarts that `warp-N` onto a fresh `/64` until it streams again. Pool is "safe" once at least half the relays are clean (10 of 20). No time cap on rotation — just attempt-bounded.
+5. **Keep-Cold Timers:** Installs `warp-keep-cold.timer` — a liveness sweep every 5 minutes (≤ 10 relays) or 15 minutes (> 10) that catches dead containers and silently throttled egresses. Rate-limit verdicts come from the client, not a probe: `warp-keep-cold-signals.service` consumes a client-reported 429 the moment it lands and restarts that `warp-N` onto a fresh `/64` until it streams again. Pool is "safe" once at least half the relays are alive — a lane answering 429 is serving. No time cap on rotation — just attempt-bounded.
 6. **One URL:** Prints the single relay URL to dial, plus a `curl` health check.
 
 ---

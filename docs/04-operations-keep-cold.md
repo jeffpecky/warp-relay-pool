@@ -1,10 +1,15 @@
 # 04 — Operations: keep-cold
 
-`keep-cold.mjs` is the **rotation controller** for the relay pool. Every timer
-fire it runs a full sweep: probes every relay with a real streaming inference
-request on each daily model, then continuously rotates any relay that answers
-HTTP 429 until it streams 200 again. Your public tunnel URLs never change —
-only the underlying WARP egress container is restarted.
+`keep-cold.mjs` is the **rotation controller** for the relay pool. It has two
+jobs. The timer (`--sweep`) probes the pool for **liveness** and health. The
+signals service (`--watch-signals`) consumes the 429 reports your client sends
+over `POST /__signal`, and rotates the egress that reported them. Your public
+tunnel URLs never change — only the underlying WARP egress container is
+restarted.
+
+**429 is the client's verdict, never a probe's.** zen-proxy terminates the TLS
+and reads the real upstream status, so it is the only authority on rate limits.
+A probe cannot see a 429 through the tunnel, and a probe 429 rotates nothing.
 
 **Naming:** `server.mjs` is the relay router (the HTTPS reverse-proxy);
 `keep-cold.mjs` is the rotation controller/prober.
@@ -16,10 +21,14 @@ Every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays):
 2. Relays answering 200 on all models → marked clean.
 3. Relays answering 429 are a **liveness** result only: the tunnel works, and the
    client owns rate-limit verdicts (see "Live signals" below). A 429 on a probe
-   is logged and rotated by nothing.
+   is logged and rotated by nothing, and it does not touch `consecutiveFailures` —
+   that counter is written only by a client report (see "The counter rule").
 4. Relays that fail some other way (401/403/400/unreachable) are left alone —
    a fresh exit IP cannot fix a protocol or auth failure.
-5. Safe-floor verdict: exit 0 when ≥ `SAFE_FLOOR` relays are clean (default half the pool — 10 of 20).
+5. Safe-floor verdict: exit 0 when ≥ `SAFE_FLOOR` relays are **alive** (clean or
+   answering 429). The floor is a liveness floor — a rate-limited lane is still
+   serving, and rotating it is the client's report to make. Default is half the
+   pool — 10 of 20.
 
 > `--reset-until-clean` and `--fresh-ip-sweep` are the exceptions: they are
 > explicit operator tools whose whole job is "rotate this egress until it
@@ -245,15 +254,33 @@ to a baseline sweep, and the exit status is unaffected.
 
 ## Exit status
 
-- `0` — every relay answered 200 for every probed model.
-- `1` — pool is not cold: a relay is throttled, quota-capped,
-  `server_error`, unreachable, or returned a bad gateway, or a relay was just
-  rotated and is still awaiting verification (pending the settle window). Quota-capped
-  relays are deliberately **not** counted clean: when the upstream free
-  tier throttles a model on `GLOBAL_QUOTA_GUARD` relays, rotation cannot
-  help and the pass skips it, but the unit still reports failure so a
-  fully throttled pool never looks green.
+`--sweep` (what the timer runs):
+
+- `0` — the pool is alive: at least `SAFE_FLOOR` relays answered (clean or
+  rate-limited). A lane answering 429 counts as alive — it is serving, and its
+  rotation is the client's report to make.
+- `1` — fewer than `SAFE_FLOOR` relays are alive: unreachable, bad gateway,
+  protocol/auth failure. A pool that answers 429 everywhere is **not** a
+  failure; it exits 0 and logs `every lane answered 429`.
 - `2` — usage or configuration error.
+
+`--signals` and `--once` instead exit 0 only when nothing is left dirty — they
+report the pool's known state per pass, not a liveness floor.
+
+## The counter rule
+
+`consecutiveFailures` belongs to the signal path, and nothing else writes it.
+`classifySignal()` is the only writer: it advances the counter per client 429
+report, and feeds it to `effectiveCooldown()` and to the tier-2 escalation
+test. No probe result touches it — not a 429, not a 502, not a `server_error`,
+not a slow lane. The prober has its own pacing (`dirty` + `probeAfter`) and
+never needed the client's ladder; sharing it would turn the first real client
+429 into a `RELAY_BACKOFF_MAX_S` lockout plus a Cloudflare registration.
+
+The same rule applies to `GLOBAL_QUOTA_GUARD`: the quota history is built from
+`last429`, which only a client-report-driven rotation writes. A probe 429 is
+logged and discarded before it can reach the guard, so the prober can never
+veto a report the client actually made.
 
 ## Tunables
 
@@ -269,9 +296,9 @@ to a baseline sweep, and the exit status is unaffected.
 | `FRESH_IP_MODEL` | First model in `PROBE_MODELS` | Target model probed during `--fresh-ip-sweep` (defaults to `deepseek-v4.1-flash-free`) |
 | `PROBE_MODELS_MODE` | `popular` | Auto-probe filter: `popular` (deepseek, glm, mimo) or `all` |
 | `PROBE_MODELS` | Dynamically discovered free models | Free tag models auto-probed from OpenCode `/inference/v1/models` |
-| `MIN_CLEAN_RATIO` | `0.5` | Fraction of pool that must be clean for `--sweep` to exit 0 (0 < ratio ≤ 1) |
+| `MIN_CLEAN_RATIO` | `0.5` | Fraction of the pool that must be **alive** (clean or rate-limited) for `--sweep` to exit 0 (0 < ratio ≤ 1) |
 | `MIN_CLEAN_COUNT` | `ceil(COUNT × MIN_CLEAN_RATIO)` | Exact override for the clean floor (overrides `MIN_CLEAN_RATIO`) |
-| `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`); `COUNT + 1` below three relays | 429-on-this-many-relays = upstream quota, skip rotation. Below three relays the default never fires: on a two-lane pool "throttled on a threshold of lanes" and "throttled everywhere" are the same count, so a rotation is the one thing that can still help |
+| `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`); `COUNT + 1` below three relays | Client 429 reports naming the same model on this many relays = upstream quota, skip rotation. Counted from reports only — a probe 429 never reaches it. Below three relays the default never fires: on a two-lane pool "throttled on a threshold of lanes" and "throttled everywhere" are the same count, so a rotation is the one thing that can still help |
 | `SPEED_MODEL` / `SLOW_THRESHOLD_MS` / `SLOW_MAX_ROTATIONS` | `nvidia/nemotron-3.5-lightning:free` / `0` / `2` | Speed rotation, disabled by default (`SLOW_MAX_ROTATIONS` is legacy: no per-pass rotation loop remains) |
 | `RELAY_STATE_FILE` | `.keep-cold/state.json` | Per-relay scheduler state (gitignored; corrupt state degrades to a baseline sweep) |
 | `RELAY_COOLDOWN_S` | `600` | Minimum gap between two rotations of the same relay |

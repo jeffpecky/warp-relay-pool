@@ -45,7 +45,9 @@
  * report names an egress whose throttle the client already saw, and restarting
  * is what replaces it. The `retry-after` header is not consulted — it describes
  * the address being abandoned, not the lane. A probe 429 no longer rotates
- * anything (it is liveness evidence, and the client owns the verdict). Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
+ * anything (it is liveness evidence, and the client owns the verdict), and it
+ * never reaches the state the client path reads: not `consecutiveFailures`, not
+ * the `last429` quota history. Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
  * one Cloudflare registration) is used only for 429 evidence, after two failed
  * post-restart verifications, and at most once per relay per TIER2_MIN_INTERVAL_S;
  * server_error and 502 rotations are tier-1 only. Nodes without wg0.conf abort
@@ -53,12 +55,12 @@
  *
  * Guardrails
  * ----------
- * A model throttled on GLOBAL_QUOTA_GUARD relays is upstream model quota: it is
- * skipped for rotation this pass, and relays failing only on such models are
- * reported as quota-capped and never counted clean. The same guard reads the
- * 429 history kept in the state file (900 s window), so quota is recognised
- * across passes. A model failing with server_error on SERVER_ERROR_GUARD relays
- * is an upstream incident: rotation is skipped for it this pass.
+ * A model the CLIENTS report as throttled on GLOBAL_QUOTA_GUARD relays is
+ * upstream model quota: rotation is skipped for it this pass. The guard reads
+ * the 429 history kept in the state file (900 s window), which only a client
+ * report writes — probes cannot populate it. A model failing with server_error
+ * on SERVER_ERROR_GUARD relays is an upstream incident: rotation is skipped for
+ * it this pass.
  *
  * Status 0 (the host cannot reach the relay) and any other unexpected status
  * (403/500/503/...) are troubled: no restart, the relay waits
@@ -1290,7 +1292,10 @@ async function freshIpSweep() {
   } else if (res.status === 429) {
    log(`#${index} probe ${FRESH_IP_MODEL} -> 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") + ` (${res.fp})`);
    throttledRelays.push(index);
-   patchRelay(state, index, { dirty: true, last429: { model: FRESH_IP_MODEL, ts: now() } });
+   // Still rate-limited, so stay dirty — but no `last429` write: that field is
+   // the signal path's quota history, and this is a probe. The guard below
+   // uses this pass's own count.
+   patchRelay(state, index, { dirty: true });
   } else {
    log(`#${index} probe ${FRESH_IP_MODEL} -> HTTP ${res.status || "unreachable"} (${res.detail})`);
   }
@@ -1463,12 +1468,13 @@ async function resetRelayUntilClean(index, models, state) {
    continue;
   }
   for (const r of failing) log(`#${index} ${r.model} unexpected ${r.status || "unreachable"} on a fresh egress (${r.detail})`.slice(0, 200));
+  // Probe evidence: leave the client's failure ladder alone (see the sweep).
   patchRelay(state, index, {
    dirty: true,
    lastProbe: now(),
    pendingVerify: false,
    probeAfter: now() + RELAY_COOLDOWN_S * 1000,
-   consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+   consecutiveFailures: relayEntry(state, index).consecutiveFailures,
   });
   return false;
  }
@@ -1478,11 +1484,11 @@ async function resetRelayUntilClean(index, models, state) {
 }
 
 /**
- * Full-pool sweep: probe every relay on every model, then rotate each
- * rate-limited egress until it streams 200 (attempt-capped, never time-capped).
- * This is what the systemd timer runs.
+ * Full-pool sweep: probe every relay on every model for liveness and health.
+ * A probe 429 is logged and rotates nothing — the client owns that verdict
+ * (POST /__signal → --signals). This is what the systemd timer runs.
  *
- * Returns true when at least SAFE_FLOOR relays are clean.
+ * Returns true when at least SAFE_FLOOR relays are alive (clean or 429).
  */
 /** Container-level healthcheck status, or "none" when no healthcheck exists. */
 async function containerHealth(index) {
@@ -1556,6 +1562,10 @@ async function sweep() {
  // nothing for a quota guard to suppress here. The guard that still matters
  // lives on the signal path (see classifySignal).
  const cleanSet = new Set();
+ // Answered 429: the lane is reachable, and the rate-limit verdict belongs to
+ // the client that terminated the TLS (POST /__signal). Liveness, nothing more.
+ const reachable = new Set();
+ // Failed some other way (401/403/400/unreachable): troubled, no reset.
  const leftAlone = [];
  for (const index of [...results.keys()].sort((a, b) => a - b)) {
   const rows = results.get(index);
@@ -1569,32 +1579,50 @@ async function sweep() {
   // from the client that read the real status (POST /__signal → signals file →
   // --signals), so the sweep's job here is liveness only: a 429 probe proves the
   // lane is reachable, which is exactly what a probe can prove.
-  const throttled = failing.filter((r) => r.status === 429);
-  for (const r of throttled) {
+  for (const r of failing.filter((r) => r.status === 429)) {
    log(`#${index} ${r.model} 429 on probe — ignored (client reports rate limits)`);
   }
   const other = failing.filter((r) => r.status !== 429);
-  for (const r of other) {
-   log(`#${index} ${r.model} ${r.status || "unreachable"} (${r.detail}) — not an egress rate limit, no reset`.slice(0, 200));
+  if (other.length === 0) {
+   // Every failing probe answered 429: the lane is reachable, and the
+   // rate-limit verdict belongs to the client that terminated the TLS.
+   reachable.add(index);
+  } else {
+   for (const r of other) {
+    log(`#${index} ${r.model} ${r.status || "unreachable"} (${r.detail}) — not an egress rate limit, no reset`.slice(0, 200));
+   }
+   leftAlone.push(index);
   }
+  // `consecutiveFailures` stays FLAT on both branches. It is the backoff
+  // counter and the tier-2 trigger of the CLIENT path (classifySignal), so any
+  // probe result counted in it would turn the first real client report into a
+  // RELAY_BACKOFF_MAX_S lockout plus a Cloudflare registration. `dirty` +
+  // `probeAfter` is all the sweep needs to probe the lane again later.
   patchRelay(state, index, {
    dirty: true,
    lastProbe: now(),
    pendingVerify: false,
    probeAfter: now() + RELAY_COOLDOWN_S * 1000,
-   consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+   consecutiveFailures: relayEntry(state, index).consecutiveFailures,
   });
-  leftAlone.push(index);
  }
 
- const cleanCount = cleanSet.size;
+ // The floor is a liveness floor: a lane answering 429 is serving, so it counts
+ // toward it. Only lanes that failed some other way are degraded, because a
+ // rate-limited lane is the client's report to rotate, not a pool fault the
+ // sweep can diagnose any more.
+ const alive = cleanSet.size + reachable.size;
  log(
-  `sweep result: ${cleanCount}/${COUNT} relay(s) clean` +
-   (leftAlone.length ? ` | not rotated: ${leftAlone.map((i) => `#${i}`).join(" ")}` : "") +
+  `sweep result: ${cleanSet.size}/${COUNT} relay(s) clean` +
+   (reachable.size ? ` | ${reachable.size} rate-limited (client's verdict)` : "") +
+   (leftAlone.length ? ` | troubled: ${leftAlone.map((i) => `#${i}`).join(" ")}` : "") +
    ` | safe floor ${SAFE_FLOOR}`,
  );
- const ok = cleanCount >= SAFE_FLOOR;
- log(ok ? "pool is safe" : `pool is degraded: ${COUNT - cleanCount} relay(s) not clean (floor ${SAFE_FLOOR})`);
+ if (cleanSet.size === 0 && reachable.size > 0) {
+  log(`every lane answered 429: reachable, but no lane is known clean — the client's reports are what rotate them`);
+ }
+ const ok = alive >= SAFE_FLOOR;
+ log(ok ? "pool is safe" : `pool is degraded: ${COUNT - alive} relay(s) not alive (floor ${SAFE_FLOOR})`);
  return ok;
 }
 
@@ -2019,7 +2047,11 @@ async function classifyRelay(index, results, ctx) {
  if (seLeft.length) ctx.seRelays.set(index, seLeft.map((r) => r.model));
 
  const entry = relayEntry(ctx.state, index);
- const n = entry.consecutiveFailures + 1;
+ // Probe-driven rotations never advance the client's failure ladder:
+ // `consecutiveFailures` belongs to classifySignal (it sets the client's
+ // cooldown and the tier-2 trigger), so a 502/server_error/slow rotation keeps
+ // it flat. The probe's own retry pacing is `probeAfter` below.
+ const n = entry.consecutiveFailures;
  const rotatable = [...seLeft, ...gateway];
 
  // Every probe was a 429: the client owns this verdict now, so leave the
@@ -2212,10 +2244,13 @@ async function pass() {
   log(`speed ${SPEED_MODEL}: ` + speedRows.map((r) => `#${r.index} ${r.ms}ms`).join(" "));
  }
 
- // Global-quota guard: observed this pass OR carried in state (900 s window) —
- // a model throttled on a majority of relays is upstream model quota and no
- // egress rotation can fix it.
- const observed429 = countByModel(all, (r) => r.status === 429);
+ // Global-quota guard: from state history only (900 s window). Probe 429s are
+ // deliberately NOT counted: a probe 429 is not evidence about the egress or
+ // about upstream quota — the client owns that verdict (POST /__signal), and
+ // letting probe results populate this set would let the prober veto a real
+ // client report, which is the native 429 checker coming back in through the
+ // side door. `last429` is written only by a rotation driven by a client
+ // report, so the history below is client evidence.
  const observedSe = countByModel(all, (r) => r.serverError);
  const history429 = new Map();
  for (let i = 1; i <= COUNT; i++) {
@@ -2228,12 +2263,10 @@ async function pass() {
  // No PROBE_MODELS filter: live signals name the client's real models, and a
  // model capped on a majority of relays is upstream quota whichever lane
  // reported it.
- for (const model of new Set([...observed429.keys(), ...history429.keys()])) {
-  const seen = observed429.get(model) ?? 0;
-  const history = history429.get(model) ?? 0;
-  if (seen < GLOBAL_QUOTA_GUARD && history < GLOBAL_QUOTA_GUARD) continue;
+ for (const [model, seen] of history429) {
+  if (seen < GLOBAL_QUOTA_GUARD) continue;
   quotaCapped.add(model);
-  log(`${model} throttled on ${Math.min(Math.max(seen, history), COUNT)}/${COUNT} relays — upstream quota, skipping rotation for it this pass (fp=${PROBE_FINGERPRINT})`);
+  log(`${model} throttled on ${Math.min(seen, COUNT)}/${COUNT} relays — upstream quota, skipping rotation for it this pass (fp=${PROBE_FINGERPRINT})`);
  }
  const serverErrCapped = new Set();
  for (const [model, n] of observedSe) {
@@ -2268,7 +2301,8 @@ async function pass() {
     for (const row of slow) {
      const entry = relayEntry(state, row.index);
      const at = now();
-     const n = entry.consecutiveFailures + 1;
+     // Latency is not client evidence: keep the client's failure ladder flat.
+     const n = entry.consecutiveFailures;
      const verdict = gate(entry, at);
      dirty.add(row.index);
      if (verdict.allowed) {
