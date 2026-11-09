@@ -1,0 +1,14 @@
+# Shell scripts, container entrypoints and service units must be LF on disk:
+# a CRLF checkout gives `sh` a "\r" in `set -u\r` and gives the kernel a
+# shebang it cannot resolve ("exec ./entrypoint.sh: no such file or directory").
+# core.autocrlf=true is common on Windows, so pin these by path rather than
+# trusting the clone.
+* text=auto
+*.sh            text eol=lf
+*.mjs           text eol=lf
+Dockerfile      text eol=lf
+*.service       text eol=lf
+*.timer         text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+.env.example    text eol=lf
