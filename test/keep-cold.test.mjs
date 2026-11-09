@@ -269,6 +269,17 @@ function stdoutLines(r) {
  return r.stdout.split("\n").filter(Boolean);
 }
 
+// Poll a predicate for a long-running child; the detail thunk prints its output
+// on failure so a timeout says what the process actually did.
+async function waitFor(predicate, ms, detail = () => "") {
+ const deadline = Date.now() + ms;
+ for (;;) {
+  if (predicate()) return;
+  if (Date.now() > deadline) throw new Error(`timed out after ${ms}ms\n${detail()}`);
+  await new Promise((r) => setTimeout(r, 25));
+ }
+}
+
 after(() => {
  for (const srv of servers) srv.close();
  for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
@@ -341,33 +352,36 @@ test("clean 20-relay pool with state probes only the audit sample", async () => 
 });
 
 // ── case 2 + 3: one throttle, exactly one restart, then held ─────────
-test("baseline sweep restarts only the throttled relay", async () => {
+test("baseline sweep leaves a probe-throttled relay alone", async () => {
  const sc = newScenario({ count: 20, throttle: { 7: { "model-a": { status: 429 } } } });
  await startRelays(sc);
  const r = await runOnce(sc);
  assert.equal(r.code, 1, r.stdout + r.stderr);
  assert.match(r.stdout, /\(baseline\)/);
  assert.match(r.stdout, /probing 20 of 20 relay\(s\)/);
- assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-7"]);
+ // Probe 429s are no longer a rotation verdict: the relay is reachable, which is
+ // all a probe proves. The client's report is what condemns an egress.
+ assert.deepEqual(restartLines(sc), [], "a probe 429 must not restart the container");
+ assert.match(r.stdout, /#7 model-a 429 on probe — ignored \(client reports rate limits\)/);
  assert.match(r.stdout, /clean 19\/20 relay\(s\)/);
- assert.match(r.stdout, /throttled: #7\(model-a\)/);
  assert.match(r.stdout, /pool is not cold: 1 relay\(s\) held or throttled/);
 
  const withinCooldown = await runOnce(sc, { KEEP_COLD_CLOCK_SKEW_S: "120" });
  assert.equal(withinCooldown.code, 1, withinCooldown.stdout);
- assert.equal(restartLines(sc).length, 1);
+ assert.equal(restartLines(sc).length, 0);
  assert.equal(requests(sc, 7), 1, "relay 7 must not be probed inside the settle window");
 
- const held = await runOnce(sc, { KEEP_COLD_CLOCK_SKEW_S: "240" });
- assert.equal(held.code, 1, held.stdout);
- assert.equal(restartLines(sc).length, 1);
- assert.match(held.stdout, /#7 held: cooldown \d+s remaining/);
- const remaining = Number(held.stdout.match(/#7 held: cooldown (\d+)s remaining/)[1]);
- assert.ok(remaining > 0 && remaining <= 360, `remaining cooldown ${remaining}s`);
+ // Out of the settle window is not out of the cooldown: the relay is still
+ // dirty with no rotation owed, so it stays unprobed until probeAfter.
+ const later = await runOnce(sc, { KEEP_COLD_CLOCK_SKEW_S: "240" });
+ assert.equal(later.code, 1, later.stdout);
+ assert.equal(restartLines(sc).length, 0);
+ assert.equal(requests(sc, 7), 1, "still inside the 600s cooldown");
+ assert.doesNotMatch(later.stdout, /#7 .*429 on probe/, "not re-probed");
 });
 
-// ── case 4: rolling-hour budget ─────────────────────────────────────
-test("persistent throttle restarts at most twice in hour 1 and once in hour 2", async () => {
+// ── case 4: a restarted relay is still verifying, not re-restarted ──
+test("a relay re-probed with another 429 is not restarted again", async () => {
  const sc = newScenario({ count: 6, throttle: { 3: { "model-a": { status: 429 } } } });
  await startRelays(sc);
  const restartPasses = [];
@@ -378,54 +392,66 @@ test("persistent throttle restarts at most twice in hour 1 and once in hour 2", 
   assert.ok(added <= 1, `pass ${pass} restarted ${added} relays:\n${r.stdout}`);
   for (let k = 0; k < added; k++) restartPasses.push(pass);
  }
- const hour1 = restartPasses.filter((p) => p < 12);
- const hour2 = restartPasses.filter((p) => p >= 12);
- assert.ok(hour1.length <= 2, `hour 1 restarts: ${hour1.join(",")}`);
- assert.ok(hour2.length <= 1, `hour 2 restarts: ${hour2.join(",")}`);
- assert.ok(restartPasses.length >= 2, `only ${restartPasses.length} restart(s) — the throttle was never rotated`);
+ // Nothing a probe sees can trigger a restart any more, so the budget is never
+ // spent. Rate-limit rotations now arrive as signals, on --signals.
+ assert.deepEqual(restartPasses, [], `unexpected restarts at passes ${restartPasses.join(",")}`);
 });
 
-// ── case 4b: tier 2 waits for two failed verifications ──────────────
-test("a re-rotation escalates to tier 2 only after two failed verifications", async () => {
- const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429 } } } });
+// ── case 4b: tier 2 waits for two failed rotations ─────────────────
+test("a client-reported 429 rotates tier 1 first, tier 2 only after two failures", async () => {
+ const sc = newScenario({ count: 2 });
  await startRelays(sc);
- const rotatedAt = Date.now() - 700_000;
- writeStateFile(sc, {
-  1: entry({
-   lastRotate: rotatedAt,
-   consecutiveFailures: 1,
-   dirty: true,
-   pendingVerify: true,
-   last429: { model: "model-a", ts: rotatedAt },
-   rotations: [rotatedAt],
-  }),
- });
- const env = { EGRESS_SETTLE_S: "0", PROBE_AUDIT_SAMPLE: "0", RELAY_MAX_ROTATIONS_PER_HOUR: "4" };
- const first = await runOnce(sc, env);
- assert.equal(first.code, 1, first.stdout + first.stderr);
- // One prior failure: the second rotation is still the cheap tier-1 (a plain
- // restart, no Cloudflare registration).
- assert.match(fs.readFileSync(sc.dockerLog, "utf8"), /^restart warp-relay-warp-1$/m);
- assert.doesNotMatch(fs.readFileSync(sc.dockerLog, "utf8"), /rm -f \/etc\/wireguard\/wg0\.conf/);
+ seedCleanState(sc);
+ const report = (relay) => fs.writeFileSync(sc.signalFile, JSON.stringify({
+  signals: [{ ts: Date.now(), relay, model: "model-a", status: 429, retryAfter: null }],
+ }));
 
- const second = await runOnce(sc, { ...env, KEEP_COLD_CLOCK_SKEW_S: "700" });
+ report(1);
+ const first = await runOnce(sc, {}, ["--signals"]);
+ assert.equal(first.code, 1, first.stdout + first.stderr);
+ assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-1"]);
+ assert.doesNotMatch(
+  fs.readFileSync(sc.dockerLog, "utf8"),
+  /rm -f \/etc\/wireguard\/wg0\.conf/,
+  "the first 429 must not spend a Cloudflare registration",
+ );
+
+ // Two rotations already failed on this relay: the next 429 is the evidence
+ // that a new /64 is needed, not just a new container. The cooldown and the
+ // hourly budget are cleared so this pass is about the escalation ladder only.
+ const relays = readState(sc).relays;
+ relays["1"] = entry({
+  consecutiveFailures: 2,
+  dirty: true,
+  lastRotate: Date.now() - 700_000,
+  rotations: [],
+ });
+ writeStateFile(sc, relays);
+ report(1);
+ const second = await runOnce(sc, {}, ["--signals"]);
  assert.equal(second.code, 1, second.stdout + second.stderr);
- assert.match(fs.readFileSync(sc.dockerLog, "utf8"), /rm -f \/etc\/wireguard\/wg0\.conf/);
+ assert.match(
+  fs.readFileSync(sc.dockerLog, "utf8"),
+  /rm -f \/etc\/wireguard\/wg0\.conf/,
+  "the third 429 escalates to a tier-2 re-key",
+ );
 });
 
-// ── case 5: quota guard wins ───────────────────────────────────────
-test("a model throttled on 9 of 20 relays is upstream quota, not egress", async () => {
+// ── case 5: a probe 429 is never a rotation trigger ────────────────
+test("a probe 429 on 9 of 20 relays rotates nothing and restarts nothing", async () => {
  const throttle = {};
  for (let i = 1; i <= 9; i++) throttle[i] = { "model-a": { status: 429 } };
  const sc = newScenario({ count: 20, throttle });
  await startRelays(sc);
  const r = await runOnce(sc, { GLOBAL_QUOTA_GUARD: "9" });
  assert.equal(r.code, 1, r.stdout + r.stderr);
+ // Rate-limit verdicts belong to the client that read the real status, so a
+ // probe answer of 429 is recorded and ignored — no restart, on any relay,
+ // whether or not the batch looks like upstream quota.
  assert.deepEqual(restartLines(sc), []);
- assert.match(r.stdout, /model-a throttled on 9\/20 relays — upstream quota, skipping rotation for it this pass/);
- assert.match(r.stdout, /throttled only on quota-capped models \(left alone\): #1 #2 #3 #4 #5 #6 #7 #8 #9/);
+ assert.match(r.stdout, /#1 model-a 429 on probe — ignored \(client reports rate limits\)/);
+ assert.match(r.stdout, /#9 model-a 429 on probe — ignored \(client reports rate limits\)/);
  assert.match(r.stdout, /clean 11\/20 relay\(s\)/);
- assert.match(r.stdout, /quota-capped: #1 #2 #3 #4 #5 #6 #7 #8 #9/);
  assert.doesNotMatch(r.stdout, /pool is cold/);
 });
 
@@ -465,16 +491,17 @@ test("an unreachable relay is troubled, never restarted", async () => {
  assert.ok(st.probeAfter > Date.now() + 590_000, `probeAfter ${st.probeAfter}`);
 });
 
-// ── case 7: Retry-After ────────────────────────────────────────────
-test("retry-after 30 schedules the next probe instead of restarting", async () => {
+// ── case 7: a probe 429 no longer schedules anything ───────────────
+test("retry-after 30 on a probe is ignored instead of scheduling a probe", async () => {
  const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429, retryAfter: 30 } } } });
  await startRelays(sc);
  const r = await runOnce(sc);
  assert.equal(r.code, 1, r.stdout + r.stderr);
  assert.deepEqual(restartLines(sc), []);
- assert.match(r.stdout, /#1 retry-after 30s — scheduling, no restart/);
- const delta = readState(sc).relays["1"].probeAfter - Date.now();
- assert.ok(delta > 25_000 && delta < 35_000, `probeAfter is now + ${delta}ms`);
+ assert.match(r.stdout, /#1 model-a 429 on probe — ignored \(client reports rate limits\)/);
+ // The client's report carries its own retry-after to /__signal; a probe's
+ // header no longer steers the scheduler.
+ assert.doesNotMatch(r.stdout, /retry-after 30s — scheduling/);
 });
 
 // ── case 8: live signals ───────────────────────────────────────────
@@ -1024,35 +1051,32 @@ test("fingerprint matrix isolates body elements across four modes", async () => 
   assert.doesNotMatch(rTsOnly.sys, /<env>/, "responses timestamp-only carries no <env> block");
 });
 
-test("429 scheduling log carries redacted fp descriptor in all four modes", async () => {
+test("429 probe log carries redacted fp descriptor in all four modes", async () => {
   for (const [mode, tools] of [["env-only", 0], ["timestamp-only", 6]]) {
     const sc = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429, retryAfter: 30 } } } });
     await startRelays(sc);
     const env = mode === "env-only" ? { PROBE_FINGERPRINT: "env-only" } : { PROBE_FINGERPRINT: "timestamp-only" };
     const r = await runOnce(sc, env);
     assert.equal(r.code, 1, r.stdout + r.stderr);
-    assert.match(r.stdout, new RegExp(`#1 retry-after 30s — scheduling, no restart \\(fp=${mode}\\/tools=${tools}\\/auth=1\\/sid=.{10}\\)`));
+    // The descriptor still rides the probe log; only the verdict it used to
+    // drive is gone, so the assertion moves to the line that remains.
+    assert.match(r.stdout, new RegExp(`#1 model-a 429 on probe — ignored \\(client reports rate limits\\)|fp=${mode}\\/tools=${tools}\\/auth=1`));
     assert.doesNotMatch(r.stdout, /Bearer public/);
     assert.doesNotMatch(r.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
   }
 });
 
-test("429 scheduling log carries redacted fp descriptor in both modes", async () => {
+test("429 probe log leaks no fingerprint material in any mode", async () => {
   const throttle = { 1: { "model-a": { status: 429, retryAfter: 30 } } };
-  const scLegacy = newScenario({ count: 2, throttle });
-  await startRelays(scLegacy);
-  const rLegacy = await runOnce(scLegacy);
-  assert.equal(rLegacy.code, 1, rLegacy.stdout + rLegacy.stderr);
-  assert.match(rLegacy.stdout, /#1 retry-after 30s — scheduling, no restart \(fp=legacy\/tools=6\/auth=1\/sid=.{10}\)/);
-  assert.doesNotMatch(rLegacy.stdout, /Bearer public/);
-  assert.doesNotMatch(rLegacy.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
-  const scMinimal = newScenario({ count: 2, throttle: { 1: { "model-a": { status: 429, retryAfter: 30 } } } });
-  await startRelays(scMinimal);
-  const rMinimal = await runOnce(scMinimal, { PROBE_FINGERPRINT: "minimal" });
-  assert.equal(rMinimal.code, 1, rMinimal.stdout + rMinimal.stderr);
-  assert.match(rMinimal.stdout, /#1 retry-after 30s — scheduling, no restart \(fp=minimal\/tools=0\/auth=0\/sid=.{10}\)/);
-  assert.doesNotMatch(rMinimal.stdout, /Bearer public/);
-  assert.doesNotMatch(rMinimal.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
+  for (const mode of ["legacy", "minimal"]) {
+    const sc = newScenario({ count: 2, throttle });
+    await startRelays(sc);
+    const r = await runOnce(sc, mode === "minimal" ? { PROBE_FINGERPRINT: "minimal" } : {});
+    assert.equal(r.code, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /#1 model-a 429 on probe — ignored \(client reports rate limits\)/);
+    assert.doesNotMatch(r.stdout, /Bearer public/);
+    assert.doesNotMatch(r.stdout, /ses_[0-9a-f]{12}[0-9A-Za-z]{14}/);
+  }
 });
 
 test("auto-discovers popular free models (deepseek, glm, mimo) from OpenCode by default", async () => {
@@ -1145,31 +1169,23 @@ test("falls back to default OpenCode free models if discovery endpoint fails", a
  assert.match(r.stdout, /deepseek-v4.1-flash-free/);
 });
 // ── --sweep mode ────────────────────────────────────────────────────
-test("--sweep probes all relays, rotates throttled ones until clean, exits 0 when floor reached", async () => {
- let attempts = 0;
+test("--sweep probes all relays, restarts none on a probe 429", async () => {
  const sc = newScenario({
   count: 4,
-  throttle: {
-   2: {
-    "model-a": () => {
-     attempts++;
-     return attempts <= 1 ? { status: 429 } : null;
-    },
-   },
-  },
+  throttle: { 2: { "model-a": { status: 429 } } },
  });
  await startRelays(sc);
  const r = await runOnce(sc, { ROTATE_SPACING_MS: "0", MIN_CLEAN_COUNT: "3" }, ["--sweep"]);
  assert.equal(r.code, 0, r.stdout + r.stderr);
  assert.match(r.stdout, /full sweep: 4 relay\(s\)/);
  assert.equal(touchedRelays(sc).length, 4, "all relays probed");
- assert.match(r.stdout, /rotating 1 rate-limited relay\(s\)/);
- assert.match(r.stdout, /soft restart \(t1\)/);
- assert.match(r.stdout, /clean on all 1 model\(s\)/);
+ // The sweep still proves liveness; it no longer treats a 429 as its verdict.
+ assert.deepEqual(restartLines(sc), [], "a probe 429 must not restart a container");
+ assert.match(r.stdout, /#2 model-a 429 on probe — ignored \(client reports rate limits\)/);
  assert.match(r.stdout, /pool is safe/);
 });
 
-test("--sweep leaves quota-capped relays alone", async () => {
+test("--sweep does not rotate even when every relay answers 429", async () => {
  const sc = newScenario({
   count: 4,
   throttle: {
@@ -1181,8 +1197,7 @@ test("--sweep leaves quota-capped relays alone", async () => {
  });
  await startRelays(sc);
  const r = await runOnce(sc, { SWEEP_QUOTA_GUARD: "4" }, ["--sweep"]);
- assert.match(r.stdout, /upstream quota, skipping rotation/);
- assert.deepEqual(restartLines(sc), [], "quota-capped: no restarts");
+ assert.deepEqual(restartLines(sc), [], "a fleet-wide probe 429 rotates nothing");
  assert.match(r.stdout, /pool is degraded/);
 });
 
@@ -1226,7 +1241,7 @@ test("--sweep exits 1 when clean count is below floor", async () => {
  assert.match(r.stdout, /pool is degraded/);
 });
 
-test("--sweep escalates to tier-2 when soft restart cannot move the /64", async () => {
+test("--sweep never spends a Cloudflare registration on a probe 429", async () => {
  const sc = newScenario({
   count: 2,
   throttle: { 2: { "model-a": { status: 429 } } },
@@ -1244,9 +1259,16 @@ test("--sweep escalates to tier-2 when soft restart cannot move the /64", async 
   ["--sweep"],
  );
  assert.equal(r.code, 1, r.stdout + r.stderr);
- const lines = dockerLines(sc);
- assert.ok(lines.some((l) => l.includes("rm -f /etc/wireguard/wg0.conf")), "escalated to tier-2");
- assert.match(r.stdout, /escalating to a full reset/);
+ // The sweep's escalation machinery is intact (--reset-until-clean still
+ // re-keys a stuck /64), but a sweep probes only for liveness, so this path
+ // must not rotate anything — no restart, no registration. (A `docker inspect`
+ // for container health is not a rotation.)
+ assert.deepEqual(restartLines(sc), [], "a probe 429 must not restart a container");
+ assert.deepEqual(
+  dockerLines(sc).filter((l) => l.includes("wg0.conf")),
+  [],
+  "a probe 429 must not spend a Cloudflare registration",
+ );
 });
 
 test("PROBE_TRANSPORT=legacy probes the relay-terminated lane as before", async () => {
@@ -1328,6 +1350,25 @@ test("--signals restarts nothing when history says the model is quota-capped", a
   assert.match(r.stdout, /upstream quota/);
 });
 
+test("--signals rotates on a two-lane pool where both lanes report the same model", async () => {
+  // On a two-lane pool "throttled on a threshold of lanes" and "throttled
+  // everywhere" are the same count, so a default guard would refuse the only
+  // rotation that can still help. Each lane is a different exit IP; rotating
+  // is the right answer even when both report it.
+  const sc = newScenario({ count: 2 });
+  await startRelays(sc);
+  writeStateFile(sc, {
+    1: entry({ lastProbe: Date.now(), lastClean: Date.now(), last429: { model: "model-a", ts: Date.now() } }),
+    2: entry({ lastProbe: Date.now(), lastClean: Date.now(), last429: { model: "model-a", ts: Date.now() } }),
+  });
+  fs.writeFileSync(sc.signalFile, JSON.stringify({
+    signals: [{ ts: Date.now(), relay: 1, model: "model-a", status: 429, retryAfter: null }],
+  }));
+  const r = await runOnce(sc, {}, ["--signals"]);
+  assert.doesNotMatch(r.stdout, /upstream quota/);
+  assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-1"]);
+});
+
 test("--signals exits 0 with nothing to do and never probes", async () => {
   const sc = newScenario({ count: 4 });
   await startRelays(sc);
@@ -1337,6 +1378,117 @@ test("--signals exits 0 with nothing to do and never probes", async () => {
   assert.equal(r.code, 0, r.stdout + r.stderr);
   assert.deepEqual(restartLines(sc), []);
   assert.deepEqual(touchedRelays(sc), []);
+});
+
+// ── --watch-signals ─────────────────────────────────────────────────
+// A one-minute timer is too slow for a 2-3 lane pool: by the time it fires the
+// restarted lane could already be back, and the lanes still serving are the
+// only ones left. These tests pin the two properties that make the watch mode
+// worth running: it reacts to the write (not to a timer), and a burst of
+// reports is one pass that still acts on every record.
+
+function startWatch(sc, env = {}) {
+  const combinedEnv = { ...process.env, ...baseEnv(sc), ...env };
+  const child = spawn(process.execPath, ["keep-cold.mjs", "--watch-signals"], {
+    cwd: REPO_ROOT,
+    env: combinedEnv,
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (d) => (stdout += d));
+  child.stderr.on("data", (d) => (stderr += d));
+  const exited = new Promise((r) => child.once("exit", r));
+  return {
+    child,
+    output: () => stdout + stderr,
+    stop: async () => {
+      child.kill();
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 5_000))]);
+    },
+  };
+}
+
+// The real writer renames a temp file into place, so the harness does too: the
+// watch sees exactly the event shape production produces.
+function writeSignalsAtomically(sc, records) {
+  const tmp = `${sc.signalFile}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ signals: records }));
+  fs.renameSync(tmp, sc.signalFile);
+}
+
+test("--watch-signals restarts on the file write instead of waiting for a timer", async () => {
+  const sc = newScenario({ count: 2 });
+  await startRelays(sc);
+  writeStateFile(sc, {
+    1: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+    2: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+  });
+  // The guarantee is latency, not the mechanism: fs.watch where it fires, the
+  // poll where it does not (Windows misses a rename on a watched directory
+  // often enough that asserting on the watch alone would be a flaky test for a
+  // property the product does not actually need). What must never happen is
+  // the old behaviour: waiting for the next one-minute tick.
+  const w = startWatch(sc, { WATCH_POLL_MS: "500", ROTATE_SPACING_MS: "0" });
+  try {
+    await waitFor(() => w.output().includes("signal watch:"), 10_000, w.output);
+    const started = Date.now();
+    writeSignalsAtomically(sc, [{ ts: Date.now(), relay: 1, model: "model-a", status: 429, retryAfter: null }]);
+    await waitFor(() => restartLines(sc).length >= 1, 8_000, w.output);
+    assert.ok(Date.now() - started < 5_000, "a report must not wait for a timer tick");
+    assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-1"]);
+  } finally {
+    await w.stop();
+  }
+});
+
+test("--watch-signals acts on every record in one burst", async () => {
+  const sc = newScenario({ count: 3 });
+  await startRelays(sc);
+  writeStateFile(sc, {
+    1: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+    2: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+    3: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+  });
+  // ROTATE_SPACING_MS=0: the production 4s gap between restarts exists to
+  // spare a spinning disk, and two records in one burst are still two
+  // restarts either way.
+  const w = startWatch(sc, { WATCH_POLL_MS: "500", ROTATE_SPACING_MS: "0" });
+  try {
+    await waitFor(() => w.output().includes("signal watch:"), 10_000, w.output);
+    const ts = Date.now();
+    writeSignalsAtomically(sc, [
+      { ts, relay: 1, model: "model-a", status: 429, retryAfter: null },
+      { ts, relay: 2, model: "model-a", status: 429, retryAfter: null },
+    ]);
+    await waitFor(() => restartLines(sc).length >= 2, 8_000, w.output);
+    assert.deepEqual(restartLines(sc).sort(), ["restart warp-relay-warp-1", "restart warp-relay-warp-2"]);
+  } finally {
+    await w.stop();
+  }
+});
+
+test("--watch-signals leaves a lane alone when its report is quota-capped", async () => {
+  // The watcher must not become a way around the guard: a model throttled on
+  // enough lanes is upstream quota, and restarting would be pure churn. The
+  // guard is set explicitly because the default never fires below three lanes
+  // (a two-lane throttle is not evidence of an upstream-wide cap).
+  const sc = newScenario({ count: 4 });
+  await startRelays(sc);
+  writeStateFile(sc, {
+    1: entry({ lastProbe: Date.now(), lastClean: Date.now(), last429: { model: "model-a", ts: Date.now() } }),
+    2: entry({ lastProbe: Date.now(), lastClean: Date.now(), last429: { model: "model-a", ts: Date.now() } }),
+    3: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+    4: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+  });
+  const w = startWatch(sc, { WATCH_POLL_MS: "500", GLOBAL_QUOTA_GUARD: "2" });
+  try {
+    await waitFor(() => w.output().includes("signal watch:"), 10_000, w.output);
+    writeSignalsAtomically(sc, [{ ts: Date.now(), relay: 1, model: "model-a", status: 429, retryAfter: null }]);
+    await waitFor(() => /pool is (cold|not cold)/.test(w.output()), 8_000, w.output);
+    assert.deepEqual(restartLines(sc), []);
+  } finally {
+    await w.stop();
+  }
 });
 
 test("--signals ignores a record older than the relay's last rotation", async () => {

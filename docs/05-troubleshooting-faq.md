@@ -30,8 +30,13 @@ be configured. See [06](06-universal-proxy.md).
 **429 on one lane, one model.** Normal per-model-per-egress throttle — the
 other lanes still serve, and the router moves the request. Either wait or
 `docker restart warp-relay-warp-N`; keep-cold does this automatically, and the
-signals timer acts within a minute of the 429. 429 on nearly every relay for
-one model = upstream quota (`GLOBAL_QUOTA_GUARD`), no rotation helps.
+signals watcher acts within milliseconds of the report. 429 on nearly every
+relay for one model = upstream quota (`GLOBAL_QUOTA_GUARD`), no rotation helps.
+
+A 429 is only reported when the **client** says so: the relay is a raw CONNECT
+pipe and cannot read a status inside the tunnel. That means a client which does
+not report (anything other than zen-proxy with `RELAY_SIGNAL_TOKEN` set) leaves
+only the periodic sweep as detection.
 
 **`503` with `Retry-After: 30`.** Every lane is parked by a **failed probe**,
 i.e. the pool has no egress at all. Check the WARP containers; a pool merely

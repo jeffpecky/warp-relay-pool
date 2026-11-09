@@ -14,14 +14,25 @@ only the underlying WARP egress container is restarted.
 Every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays):
 1. Probes **every** relay on every popular free model (`deepseek`, `glm`, `mimo` by default).
 2. Relays answering 200 on all models → marked clean.
-3. Relays answering 429 → restarted onto a fresh `/64` egress and re-probed.
-   Rotation continues until 200 or `MAX_RESET_ATTEMPTS` (attempt cap, no time cap).
-4. Safe-floor verdict: exit 0 when ≥ `SAFE_FLOOR` relays are clean (default half the pool — 10 of 20).
+3. Relays answering 429 are a **liveness** result only: the tunnel works, and the
+   client owns rate-limit verdicts (see "Live signals" below). A 429 on a probe
+   is logged and rotated by nothing.
+4. Relays that fail some other way (401/403/400/unreachable) are left alone —
+   a fresh exit IP cannot fix a protocol or auth failure.
+5. Safe-floor verdict: exit 0 when ≥ `SAFE_FLOOR` relays are clean (default half the pool — 10 of 20).
+
+> `--reset-until-clean` and `--fresh-ip-sweep` are the exceptions: they are
+> explicit operator tools whose whole job is "rotate this egress until it
+> streams again", so they still act on a probe 429.
 
 - **Two-Tier Rotation:**
   - **Tier 1 (Default):** `docker restart` with `wg0.conf` kept — same keys, fresh `/64`, zero Cloudflare registrations.
   - **Tier 2 (Fallback):** Deletes `wg0.conf` and restarts — new keypair, one Cloudflare registration. Escalates when a soft restart cannot move the `/64` block, at most once per relay per `TIER2_MIN_INTERVAL_S`.
-- **Egress Rotation in Sweep:** In `--sweep` mode, every relay answering HTTP 429 is treated as having a throttled egress address and rotated until clean (`SWEEP_QUOTA_GUARD=0` by default so pool-wide 429 waves never halt rotation). In incremental `--once` mode, `GLOBAL_QUOTA_GUARD` still prevents rotation if a model is throttled pool-wide.
+- **Egress Rotation in Sweep:** `--sweep` no longer rotates on a probe 429 —
+  the sweep is a liveness pass, and rate-limit evidence comes from the client
+  (see "Live signals"). Incremental `--once` behaves the same way. Only the
+  explicit operator tools (`--reset-until-clean`, `--fresh-ip-sweep`) still
+  treat a probe 429 as "rotate this egress".
 - Concurrency: `ROTATE_CONCURRENCY` (default `1`) serialises restarts; `ROTATE_SPACING_MS` adds a mandatory gap between each.
 
 ### Healthcheck remediation lane
@@ -160,36 +171,49 @@ budget in a few passes.
 `EGRESS_SETTLE_S` (150 s) and is not probed inside that window. Probing during
 the WARP handshake is what used to produce false 429s and back-to-back restarts.
 
-**Honouring `Retry-After`.** A 429 that carries `retry-after: N` with
-`N <= 120` schedules the next attempt at that deadline instead of restarting the
-container: upstream has already said when it will accept traffic again.
+**Honouring `Retry-After`.** A live 429 signal that carries `retry-after: N`
+with `N <= 120` schedules the next probe at that deadline instead of restarting
+the container: upstream has already said when it will accept traffic again. A
+*probe* 429 no longer schedules anything — probes are liveness-only (below).
 
 **Restart spacing.** Restarts are serialised at least `ROTATE_SPACING_MS`
 (4000 ms) apart, so the host disk never sees two container stop/starts at once.
 
-**Live signals.** With a relay image built with the signal writer and
-`LIVE_SIGNALS=1`, the relay app appends one record per `(relay, model)` state
-change to `LIVE_SIGNAL_FILE` and keep-cold processes it with no probe at all: a
+**Live signals — the only 429 detector.** A probe never decides that an egress
+is throttled any more. A probe 429 proves only that the tunnel is alive, so it
+is logged and ignored. Rate-limit evidence comes from the client: it terminates
+TLS itself, sees the real upstream status, and — because the relay is a raw
+CONNECT pipe that can read no status inside the tunnel — reports it out of band
+over `POST /__signal` (`RELAY_SIGNAL_TOKEN`, see `.env.example`). The report
+names the client, never a lane; the relay resolves which lane that client was
+bound to and cools it, which is also what makes the next tunnel rotate. The
+relay then appends one record per `(relay, model)` state change to
+`LIVE_SIGNAL_FILE`, and keep-cold processes it with no probe at all: a
 `status: 429` record routes that relay straight through the rotation gate (and
 feeds the quota-guard history), any other status marks that relay clean. The
 file is consumed destructively — after a pass it is atomically rewritten as
 `{"signals":[]}` — so the relay app owns appends and keep-cold owns resets, and
 one writer each keeps the host disk quiet. keep-cold marks its own probe
 requests (`x-keep-cold-probe`): the relay app neither signals them nor forwards
-the marker upstream, so a probe's own 429 can never come back as "live traffic"
-and a stale record can never re-rotate a relay that was already restarted after
-it (records older than the relay's `lastRotate` are ignored). With
-`LIVE_SIGNALS=0` keep-cold never
-touches the file, and the flag is read separately by each process — the
-generator bakes it into the relay container while the host run takes it from its
-own `Environment=`/`--env-file`, so enabling one side alone changes nothing.
+the marker upstream, and a stale record can never re-rotate a relay that was
+already restarted after it (records older than the relay's `lastRotate` are
+ignored).
+
+The shipped client is zen-proxy (`zen-proxy/src/relay.mjs`); it must carry its
+own `c-<id>` as the proxy userinfo, because that is the identity the relay
+resolved the lane for. Anything else that dials the relay over CONNECT is
+invisible to this path and gets the periodic sweep's liveness-only treatment.
+
+`LIVE_SIGNALS=1` is no longer required for the file to be consumed:
+`RELAY_SIGNAL_TOKEN` implies the signal writer, since a report that only cools
+a lane in memory would leave the container throttled. With no token the
+endpoint answers 404 and the install exposes no new surface.
 
 This path is optional: when the file is absent or corrupt the probe scheduler
 above runs unchanged, so a pool that never enables signals still converges. The
 relay app sees the file at `/signals/signals.json` only because the compose file
 bind-mounts `./.keep-cold:/signals`; the host prober reads the same bytes as
-`.keep-cold/signals.json`. `retry-after` inside a signal record is informational
-only — only a probe's own 429 can schedule a retry instead of a restart.
+`.keep-cold/signals.json`.
 
 **Degradation.** State lives in `RELAY_STATE_FILE` (`.keep-cold/state.json`,
 gitignored) and is written merge-on-write so concurrent writers cannot lose
@@ -224,7 +248,7 @@ to a baseline sweep, and the exit status is unaffected.
 | `PROBE_MODELS` | Dynamically discovered free models | Free tag models auto-probed from OpenCode `/inference/v1/models` |
 | `MIN_CLEAN_RATIO` | `0.5` | Fraction of pool that must be clean for `--sweep` to exit 0 (0 < ratio ≤ 1) |
 | `MIN_CLEAN_COUNT` | `ceil(COUNT × MIN_CLEAN_RATIO)` | Exact override for the clean floor (overrides `MIN_CLEAN_RATIO`) |
-| `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`) | 429-on-this-many-relays = upstream quota, skip rotation (capped at `COUNT`; override via env, see `.env.example`) |
+| `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`); `COUNT + 1` below three relays | 429-on-this-many-relays = upstream quota, skip rotation. Below three relays the default never fires: on a two-lane pool "throttled on a threshold of lanes" and "throttled everywhere" are the same count, so a rotation is the one thing that can still help |
 | `SPEED_MODEL` / `SLOW_THRESHOLD_MS` / `SLOW_MAX_ROTATIONS` | `nvidia/nemotron-3.5-lightning:free` / `0` / `2` | Speed rotation, disabled by default (`SLOW_MAX_ROTATIONS` is legacy: no per-pass rotation loop remains) |
 | `RELAY_STATE_FILE` | `.keep-cold/state.json` | Per-relay scheduler state (gitignored; corrupt state degrades to a baseline sweep) |
 | `RELAY_COOLDOWN_S` | `600` | Minimum gap between two rotations of the same relay |
@@ -234,7 +258,8 @@ to a baseline sweep, and the exit status is unaffected.
 | `EGRESS_SETTLE_S` | `150` | Quiet window after a restart before the relay is probed again |
 | `ROTATE_SPACING_MS` | `4000` | Minimum gap between `docker restart` calls |
 | `PROBE_CONCURRENCY` | `4` | Parallel probes per pass (probes only, never restarts) |
-| `LIVE_SIGNALS` / `LIVE_SIGNAL_FILE` | `0` / `.keep-cold/signals.json` (container: `/signals/signals.json`) | Live-429 input written by the relay app; needs a rebuilt relay image plus the compose `.keep-cold` mount. Absent file = probe scheduler unchanged |
+| `LIVE_SIGNALS` / `LIVE_SIGNAL_FILE` | `0` / `.keep-cold/signals.json` (container: `/signals/signals.json`) | Live-429 input written by the relay app. `RELAY_SIGNAL_TOKEN` alone implies the writer. Absent file = probe scheduler unchanged |
+| `WATCH_DEBOUNCE_MS` / `WATCH_POLL_MS` | `250` / `2000` | `--watch-signals` only: burst collapse, and the portable poll fallback where `fs.watch` misses a rename |
 | `TIER2_MIN_INTERVAL_S` / `TIER2_STATE_FILE` | `3600` / `.keep-cold/tier2-state.json` | Minimum gap between tier-2 re-keys for one relay, persisted across timer fires |
 | `ROTATE_CONCURRENCY` | `1` | Parallel rotations (serial by default) |
 | `MAX_ROTATIONS` | `4` | **Legacy** — accepted, no longer used: a pass makes at most one restart per relay (see `RELAY_COOLDOWN_S` / `RELAY_MAX_ROTATIONS_PER_HOUR`) |

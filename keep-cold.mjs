@@ -21,8 +21,9 @@
  *   - relays still marked dirty whose probeAfter timer expired,
  *   - a round-robin audit sample of PROBE_AUDIT_SAMPLE clean relays, so a
  *     silent per-egress throttle is still discovered,
- *   - relays named by live traffic signals (LIVE_SIGNALS=1, written by
- *     server.mjs), which are rotated without any inference probe at all.
+ *   - relays named by live traffic signals (written by server.mjs from a
+ *     client's POST /__signal), which are rotated without any inference probe
+ *     at all.
  * On a healthy 20-relay pool that is PROBE_AUDIT_SAMPLE requests per pass
  * instead of COUNT * |PROBE_MODELS| (60 before this change) — the disk-I/O
  * storm the old full sweep caused on the 5400 rpm host is gone.
@@ -41,12 +42,13 @@
  * chain that starts them at least ROTATE_SPACING_MS apart.
  *
  * A 429 carrying a numeric `retry-after` <= 120 s never restarts: it sets the
- * next probe time instead. Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
- * one Cloudflare registration) is used only for pure 429 batches, after two
- * failed post-restart verifications, and at most once per relay per
- * TIER2_MIN_INTERVAL_S; server_error and 502 rotations are tier-1 only. Nodes
- * without wg0.conf abort the re-key and fall back to a plain restart, leaving
- * their registration untouched.
+ * next probe time instead. That applies to a client's report, which carries the
+ * header; a probe 429 no longer rotates anything (it is liveness evidence, and
+ * the client owns the verdict). Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
+ * one Cloudflare registration) is used only for 429 evidence, after two failed
+ * post-restart verifications, and at most once per relay per TIER2_MIN_INTERVAL_S;
+ * server_error and 502 rotations are tier-1 only. Nodes without wg0.conf abort
+ * the re-key and fall back to a plain restart, leaving their registration untouched.
  *
  * Guardrails
  * ----------
@@ -157,28 +159,28 @@
  *   SLOW_MAX_ROTATIONS. Nothing here waits for readiness or verifies a rotation
  *   inline any more; those knobs only guarded the old retry loop.
  */
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--signals|--fresh-ip-sweep|--reset-until-clean] [--help]
+const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--signals|--watch-signals|--fresh-ip-sweep|--reset-until-clean] [--help]
 
-  --sweep            full-pool scan + rotate every rate-limited relay until clean
-                     (what the systemd timer runs)
+  --sweep            full-pool liveness scan (what the systemd timer runs)
   --once             incremental pass: probe only suspects + audit sample
   --loop             incremental pass every INTERVAL_S seconds (foreground)
   --probe            read-only per-relay probe report (no rotation, no state writes)
   --signals          act only on LIVE_SIGNAL_FILE records: no probes, no audit
-                     sample, no state scan (minute-granularity repair)
+                     sample, no state scan
+  --watch-signals    like --signals, but run the moment a record lands (long-running)
   --fresh-ip-sweep   full-pool tier-2 re-key + fresh IP verification + probe sweep
   --reset-until-clean smart targeted full reset of rate-limited relays until 200 OK
   --help             print this text and exit`;
 
 const argv = process.argv.slice(2);
-const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--signals", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
+const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--signals", "--watch-signals", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
 if (unknownArgs.length) {
  console.error(`keep-cold: unknown argument(s): ${unknownArgs.join(" ")}`);
  console.error(USAGE);
@@ -195,10 +197,11 @@ const SWEEP = argv.includes("--sweep");
 const LOOP = argv.includes("--loop");
 const ONCE = argv.includes("--once");
 const SIGNALS = argv.includes("--signals");
+const WATCH_SIGNALS = argv.includes("--watch-signals");
 
-const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP, SIGNALS].filter(Boolean);
+const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP, SIGNALS, WATCH_SIGNALS].filter(Boolean);
 if (modeFlags.length > 1) {
- console.error("keep-cold: --sweep, --once, --loop, --probe, --signals, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
+ console.error("keep-cold: --sweep, --once, --loop, --probe, --signals, --watch-signals, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
  process.exit(2);
 }
 
@@ -430,7 +433,19 @@ const RESPONSES_MODELS = new Set(
 const FRESH_IP_MODEL = process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
 const MAX_RESET_ATTEMPTS = envInt("MAX_RESET_ATTEMPTS", 10, { min: 1, max: 50 });
 const SOFT_ROTATIONS_BEFORE_TIER2 = envInt("SOFT_ROTATIONS_BEFORE_TIER2", 1, { min: 1, max: 50 });
-const GLOBAL_QUOTA_GUARD = Math.min(envInt("GLOBAL_QUOTA_GUARD", Math.max(8, COUNT - 1), { min: 1 }), COUNT);
+// Below three relays, "throttled on a threshold of lanes" and "throttled
+// everywhere" are the same statement, so the default must not fire: on a
+// two-lane pool the only surviving lane is the whole pool, and a rotation is
+// the one thing that can still help. An explicit GLOBAL_QUOTA_GUARD still wins
+// — the operator may know the model really is capped.
+const GLOBAL_QUOTA_GUARD = Math.min(
+ envInt(
+  "GLOBAL_QUOTA_GUARD",
+  COUNT < 3 ? COUNT + 1 : Math.max(8, COUNT - 1),
+  { min: 1 },
+ ),
+ COUNT + 1,
+);
 const MAX_POOL_REGISTRATIONS_PER_HOUR = envInt("MAX_POOL_REGISTRATIONS_PER_HOUR", 60, { min: 1, max: 200 });
 const SPEED_MODEL = process.env.SPEED_MODEL ?? "nvidia/nemotron-3.5-lightning:free";
 const SLOW_THRESHOLD_MS = envInt("SLOW_THRESHOLD_MS", 0);
@@ -856,6 +871,10 @@ function readSignals() {
  }
  const list = Array.isArray(parsed?.signals) ? parsed.signals : null;
  if (!list) return null;
+ // Nothing to consume means nothing to write. Without this an idle pass
+ // rewrites the file, which the --watch-signals watcher would read as a new
+ // report and answer with another pass — a self-sustaining loop.
+ if (list.length === 0) return list;
  try {
   fs.mkdirSync(path.dirname(LIVE_SIGNAL_FILE), { recursive: true });
   const tmp = `${LIVE_SIGNAL_FILE}.${process.pid}.signals.tmp`;
@@ -1531,19 +1550,11 @@ async function sweep() {
   },
  );
 
- const SWEEP_QUOTA_GUARD = envInt("SWEEP_QUOTA_GUARD", 0);
- const quotaCapped = new Set();
- if (SWEEP_QUOTA_GUARD > 0) {
-  const all = [...results.values()].flat();
-  const observed429 = countByModel(all, (r) => r.status === 429);
-  for (const [model, n] of observed429) {
-   if (n < SWEEP_QUOTA_GUARD) continue;
-   quotaCapped.add(model);
-   log(`${model} throttled on ${n}/${COUNT} relays — upstream quota, skipping rotation for it this sweep`);
-  }
- }
+ // SWEEP_QUOTA_GUARD and its per-model 429 count are gone with probe-driven
+ // rate-limit handling: the sweep no longer rotates on a 429, so there is
+ // nothing for a quota guard to suppress here. The guard that still matters
+ // lives on the signal path (see classifySignal).
  const cleanSet = new Set();
- const toReset = [];
  const leftAlone = [];
  for (const index of [...results.keys()].sort((a, b) => a - b)) {
   const rows = results.get(index);
@@ -1553,33 +1564,26 @@ async function sweep() {
    cleanSet.add(index);
    continue;
   }
-  const rotatable = failing.filter((r) => r.status === 429 && !quotaCapped.has(r.model));
-  const capped = failing.filter((r) => r.status === 429 && quotaCapped.has(r.model));
+  // --sweep does not reset on a probe 429 any more. Rate-limit evidence comes
+  // from the client that read the real status (POST /__signal → signals file →
+  // --signals), so the sweep's job here is liveness only: a 429 probe proves the
+  // lane is reachable, which is exactly what a probe can prove.
+  const throttled = failing.filter((r) => r.status === 429);
+  for (const r of throttled) {
+   log(`#${index} ${r.model} 429 on probe — ignored (client reports rate limits)`);
+  }
   const other = failing.filter((r) => r.status !== 429);
   for (const r of other) {
    log(`#${index} ${r.model} ${r.status || "unreachable"} (${r.detail}) — not an egress rate limit, no reset`.slice(0, 200));
   }
-  if (other.length || rotatable.length === 0) {
-   patchRelay(state, index, {
-    dirty: true,
-    lastProbe: now(),
-    pendingVerify: false,
-    probeAfter: now() + RELAY_COOLDOWN_S * 1000,
-    consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
-   });
-   leftAlone.push(index);
-   if (capped.length) log(`#${index} throttled only on quota-capped models (left alone)`);
-   continue;
-  }
-  log(`#${index} rate limited on ${rotatable.map((r) => r.model).join(", ")} — queued for reset`);
-  toReset.push(index);
- }
-
- if (toReset.length) {
-  log(`rotating ${toReset.length} rate-limited relay(s) until clean (attempt cap ${MAX_RESET_ATTEMPTS} per relay, no time cap)...`);
-  await runPool(toReset, ROTATE_CONCURRENCY, async (index) => {
-   if (await resetRelayUntilClean(index, models, state)) cleanSet.add(index);
+  patchRelay(state, index, {
+   dirty: true,
+   lastProbe: now(),
+   pendingVerify: false,
+   probeAfter: now() + RELAY_COOLDOWN_S * 1000,
+   consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
   });
+  leftAlone.push(index);
  }
 
  const cleanCount = cleanSet.size;
@@ -1977,18 +1981,23 @@ async function classifyRelay(index, results, ctx) {
 
  const capped = [];
  const srvErr = [];
- const hot = [];
  const gateway = [];
  const other = [];
+ const throttled = [];
  for (const r of failing) {
   if (r.serverError) {
    if (ctx.serverErrCapped.has(r.model)) capped.push(r);
    else srvErr.push(r);
    continue;
   }
+  // A probe that answers 429 is no longer evidence about the egress: upstream
+  // throttles a (model, egress) bucket, and the probe's own shape is a guess at
+  // real traffic. Rate-limit reporting belongs to the client that terminated
+  // the TLS and read the real status — it POSTs /__signal and the relay names
+  // the lane (see server.mjs handleSignal). Restarting a container on a probe
+  // 429 churned WARP registrations to rediscover what the client already knew.
   if (r.status === 429) {
-   if (ctx.quotaCapped.has(r.model)) capped.push(r);
-   else hot.push(r);
+   throttled.push(r);
    continue;
   }
   if (r.status === 502) {
@@ -2006,12 +2015,27 @@ async function classifyRelay(index, results, ctx) {
   if (evt) log(`#${index} ${r.model} server_error in 200 envelope (SSE ${evt})`);
   else log(`#${index} ${r.model} server_error HTTP ${r.status}`);
  }
- if (hot.length) ctx.hotRelays.set(index, hot.map((r) => r.model));
  if (seLeft.length) ctx.seRelays.set(index, seLeft.map((r) => r.model));
 
  const entry = relayEntry(ctx.state, index);
  const n = entry.consecutiveFailures + 1;
- const rotatable = [...seLeft, ...hot, ...gateway];
+ const rotatable = [...seLeft, ...gateway];
+
+ // Every probe was a 429: the client owns this verdict now, so leave the
+ // container alone and just re-check later. Not `clean` — nothing proved the
+ // egress healthy — and not a rotation, which is the churn this removes.
+ if (rotatable.length === 0 && capped.length === 0 && other.length === 0 && throttled.length) {
+  for (const r of throttled) log(`#${index} ${r.model} 429 on probe — ignored (client reports rate limits)`);
+  ctx.dirty.add(index);
+  patchRelay(ctx.state, index, {
+   dirty: true,
+   lastProbe: at,
+   pendingVerify: false,
+   probeAfter: at + RELAY_COOLDOWN_S * 1000,
+   consecutiveFailures: entry.consecutiveFailures,
+  });
+  return;
+ }
 
  if (rotatable.length === 0 && capped.length === 0 && other.length === 0) {
   // Only transient server_errors failed: the re-probe proved them gone.
@@ -2048,37 +2072,22 @@ async function classifyRelay(index, results, ctx) {
   return;
  }
 
- // Honour Retry-After instead of restarting: schedule the next probe.
- const retryAfter = hot.filter((r) => Number.isFinite(r.retryAfter) && r.retryAfter >= 0 && r.retryAfter <= 120);
- if (retryAfter.length) {
-  const waitS = Math.max(...retryAfter.map((r) => r.retryAfter));
-  ctx.dirty.add(index);
-  patchRelay(ctx.state, index, {
-   dirty: true,
-   lastProbe: at,
-   last429: { model: retryAfter[0].model, ts: at },
-   probeAfter: at + waitS * 1000,
-   consecutiveFailures: n,
-   pendingVerify: false,
-  });
-  log(`#${index} retry-after ${waitS}s — scheduling, no restart (${retryAfter[0].fp})`);
-  return;
- }
+ // Retry-After scheduling used to live here for probe 429s. It is gone with
+ // them: a client's report carries its own retry-after to /__signal, and the
+ // relay's 429 cooldown is what honours it.
 
  const verdict = gate(entry, at);
  if (verdict.allowed) {
   ctx.dirty.add(index);
-  // Tier-2 spends a registration: only for pure 429 batches, and only for a
-  // relay that has already been restarted at least once.
-  const pure429 = hot.length > 0 && seLeft.length === 0 && gateway.length === 0;
+  // A probe-driven rotation is always tier 1. Tier 2 spends a Cloudflare
+  // registration and a re-key is what crash-loops a container when CF throttles
+  // registration, so the escalation ladder belongs to the path holding real
+  // rate-limit evidence: classifySignal, on a client's report.
   ctx.rotations.push({
    index,
    n,
-   // Tier-2 spends a Cloudflare registration and a re-key is what crash-loops a
-  // container when CF throttles registration. Escalate only after two failed
-  // post-restart verifications: the first re-rotation gets a cheap tier-1.
-  tier2: entry.consecutiveFailures >= 2 && pure429 && tier2Allowed(index),
-   model: hot[0]?.model ?? seLeft[0]?.model ?? gateway[0]?.model ?? null,
+   tier2: false,
+   model: seLeft[0]?.model ?? gateway[0]?.model ?? null,
   });
   return;
  }
@@ -2091,7 +2100,6 @@ async function classifyRelay(index, results, ctx) {
   probeAfter: Math.max(entry.cooldownUntil, at + EGRESS_SETTLE_S * 1000),
   consecutiveFailures: n,
  };
- if (hot.length) patch.last429 = { model: hot[0].model, ts: at };
  patchRelay(ctx.state, index, patch);
  log(`#${index} held: ${verdict.reason}`);
 }
@@ -2101,7 +2109,6 @@ function classifySignal(index, model, ctx) {
  const at = now();
  const entry = relayEntry(ctx.state, index);
  const n = entry.consecutiveFailures + 1;
- if (model) ctx.hotRelays.set(index, [model]);
  // A model the guards call upstream quota/incident cannot be fixed by an
  // egress change: touching every signalled relay would be the exact churn
  // this scheduler exists to prevent.
@@ -2240,7 +2247,6 @@ async function pass() {
   quotaCapped,
   serverErrCapped,
   rotations: [],
-  hotRelays: new Map(),
   seRelays: new Map(),
   cappedOnly: [],
  };
@@ -2292,17 +2298,12 @@ async function pass() {
  await runPool(ctx.rotations, ROTATE_CONCURRENCY, (job) => runRotation(job, state, dirty));
 
  // ── summary ──
- const hotDesc = [...ctx.hotRelays.entries()]
-  .sort((a, b) => a[0] - b[0])
-  .map(([i, models]) => `#${i}(${models.join(",")})`)
-  .join(" ");
  const seDesc = [...ctx.seRelays.entries()]
   .sort((a, b) => a[0] - b[0])
   .map(([i, models]) => `#${i}(${models.join(",")})`)
   .join(" ");
  const cleanCount = COUNT - dirty.size;
  log(`clean ${cleanCount}/${COUNT} relay(s)`
-  + (hotDesc ? ` | throttled: ${hotDesc}` : "")
   + (seDesc ? ` | server_error: ${seDesc}` : "")
   + (ctx.cappedOnly.length ? ` | quota-capped: ${ctx.cappedOnly.map((i) => `#${i}`).join(" ")}` : ""));
  if (dirty.size === 0) log("pool is cold");
@@ -2354,7 +2355,6 @@ async function signalsPass() {
   quotaCapped,
   serverErrCapped: new Set(),
   rotations: [],
-  hotRelays: new Map(),
   seRelays: new Map(),
   cappedOnly: [],
  };
@@ -2406,10 +2406,120 @@ async function signalsPass() {
  return dirty.size === 0;
 }
 
+// ── Signals watcher ─────────────────────────────────────────────────
+/**
+ * --watch-signals: run the signals pass the moment a report lands.
+ *
+ * A timer can only be as fast as its period, and one minute is a long time on a
+ * 2-3 lane pool: the lanes still serving are the only ones left, and the
+ * restarted lane could already be back. So watch the signal file itself and
+ * react on the write. `fs.watch` on a directory does not fire on every platform
+ * for a rename, so a poll runs alongside it; the poll is what makes this
+ * portable, the watch is what makes it immediate.
+ *
+ * Fire-and-forget by design: a burst of reports collapses into one pass
+ * (debounced), and a running worker is never doubled — a fleet-wide 429 must not
+ * start ten restarts at once.
+ *
+ * Each trigger spawns the SAME `--signals` worker the timer used to run, under
+ * the SAME `/tmp/warp-keep-cold.lock`. That is deliberate: this process must not
+ * hold the sweep's lock for its own lifetime (a long-running unit holding it
+ * would make every full sweep skip), and the one-pass code path stays the only
+ * implementation. The cost is a process spawn per report, which is noise next
+ * to the container restart that follows.
+ */
+async function watchSignals() {
+ const dir = path.dirname(path.resolve(LIVE_SIGNAL_FILE));
+ const DEBOUNCE_MS = envInt("WATCH_DEBOUNCE_MS", 250, { min: 0 });
+ const POLL_MS = envInt("WATCH_POLL_MS", 2_000, { min: 250 });
+ const LOCK_FILE = "/tmp/warp-keep-cold.lock";
+ const script = path.resolve(process.argv[1]);
+ let running = null;
+ let queued = false;
+ let timer = null;
+
+ // One worker at a time: the file is consumed destructively, so two passes
+ // racing would split the reports between them.
+ function runOnceNow(why) {
+  if (running) {
+   queued = true;
+   return running;
+  }
+  running = (async () => {
+   log(`signals watch: ${why}`);
+   const child = spawn(
+    // flock where it exists: a pass that collides with a sweep is a skip, not a
+    // second concurrent rotation. Windows (the test harness) has no flock.
+    process.platform === "win32" ? process.execPath : "/usr/bin/flock",
+    process.platform === "win32"
+      ? [script, "--signals"]
+      : ["-n", "-E", "0", LOCK_FILE, process.execPath, script, "--signals"],
+    { cwd: process.cwd(), env: process.env, stdio: ["ignore", "inherit", "inherit"] },
+   );
+   await new Promise((resolve) => {
+    child.once("error", (e) => {
+     log(`signals worker failed to start: ${shortReason(e).slice(0, 200)}`);
+     resolve();
+    });
+    child.once("exit", (code) => {
+     // flock's -E 0 means "skipped, the sweep holds the lock" — expected, not
+     // an error, and the next trigger picks the record up.
+     if (code !== 0 && code !== 1) log(`signals worker exited ${code}`);
+     resolve();
+    });
+   });
+  })();
+  return running.then(() => {
+   running = null;
+   if (queued) {
+    queued = false;
+    schedule("queued report");
+   }
+  });
+ }
+
+ function schedule(why) {
+  if (timer !== null) return;
+  timer = setTimeout(() => {
+   timer = null;
+   void runOnceNow(why);
+  }, DEBOUNCE_MS);
+  timer.unref?.();
+ }
+
+ log(`signal watch: ${LIVE_SIGNAL_FILE} (debounce ${DEBOUNCE_MS}ms, poll ${POLL_MS}ms)`);
+ let watcher = null;
+ try {
+  watcher = fs.watch(dir, (_event, name) => {
+   if (!name || String(name) === path.basename(LIVE_SIGNAL_FILE)) schedule("file change");
+  });
+  watcher.on("error", (err) => log(`signal watch: watch failed (${shortReason(err)}) — polling only`));
+ } catch (err) {
+  // A missing directory or an unsupported platform: the poll below still works.
+  log(`signal watch: cannot watch ${dir} (${shortReason(err)}) — polling only`);
+ }
+ const poll = setInterval(() => schedule("poll"), POLL_MS);
+ poll.unref?.();
+
+ // Ctrl-C / SIGTERM must not leave a restart half-done: nothing is awaited past
+ // its own rotation, and every write is already atomic (tmp + rename).
+ const stop = () => {
+  clearInterval(poll);
+  watcher?.close?.();
+  process.exitCode = 0;
+ };
+ process.once("SIGINT", stop);
+ process.once("SIGTERM", stop);
+ // Keep the process alive with no other handles (both are unref'd above).
+ await new Promise(() => {});
+}
+
 // ── Entry point ─────────────────────────────────────────────────────
 if (PROBE_ONLY) {
  const ok = await probePool();
  process.exitCode = ok ? 0 : 1;
+} else if (WATCH_SIGNALS) {
+ await watchSignals();
 } else if (SIGNALS) {
  const ok = await signalsPass();
  process.exitCode = ok ? 0 : 1;

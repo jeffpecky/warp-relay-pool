@@ -93,7 +93,10 @@ router, which can see things a client cannot: a lane's last probe result, its
   thing to paste. Per-relay URLs made rotation a client-config change.
 - **A `CONNECT` tunnel is the exception.** It splices a raw byte pipe for the
   life of the connection, so it occupies one egress for that life. That is the
-  protocol, not a routing decision.
+  protocol, not a routing decision — and because the relay only sees encrypted
+  bytes, a TLS-terminating client must report its own `429` to `POST /__signal`
+  for the pool to cool that lane. Detail:
+  [07-single-url-router.md](07-single-url-router.md#reported-429s-the-control-path).
 
 ## Why per-relay WARP egress
 

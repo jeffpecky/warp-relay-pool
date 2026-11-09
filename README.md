@@ -44,7 +44,7 @@ Or run non-interactively with auto-detected sizing recommendations:
 2. **Hardware Sizing:** Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot**.
 3. **MicroWARP Build:** Builds the ultra-lightweight WireGuard + microsocks engine (~1.8 MiB RAM per relay).
 4. **Ingress Wiring:** Exposes the router on a public HTTPS URL (`--with-tunnels`, no Cloudflare account or open inbound port needed) or on your Tailscale address.
-5. **Keep-Cold Timers:** Installs `warp-keep-cold.timer` — a full sweep every 5 minutes (≤ 10 relays) or 15 minutes (> 10). Any relay returning HTTP 429 is restarted onto a fresh `/64` egress and re-probed until it streams again. Pool is "safe" once at least half the relays are clean (10 of 20). No time cap on rotation — just attempt-bounded. Plus `warp-keep-cold-signals.timer`, which consumes 429 signals every minute so a fresh throttle is repaired long before the next sweep.
+5. **Keep-Cold Timers:** Installs `warp-keep-cold.timer` — a liveness sweep every 5 minutes (≤ 10 relays) or 15 minutes (> 10) that catches dead containers and silently throttled egresses. Rate-limit verdicts come from the client, not a probe: `warp-keep-cold-signals.service` consumes a client-reported 429 the moment it lands and restarts that `warp-N` onto a fresh `/64` until it streams again. Pool is "safe" once at least half the relays are clean (10 of 20). No time cap on rotation — just attempt-bounded.
 6. **One URL:** Prints the single relay URL to dial, plus a `curl` health check.
 
 ---
@@ -161,8 +161,9 @@ docker restart warp-relay-warp-1
 
 To run a single probe pass manually:
 ```bash
-node keep-cold.mjs --once      # full sweep
-node keep-cold.mjs --signals   # consume 429 signals only, no probing
+node keep-cold.mjs --once           # incremental liveness pass
+node keep-cold.mjs --signals        # consume 429 signals only, no probing
+node keep-cold.mjs --watch-signals  # same, but act the moment a report lands
 ```
 
 ---
@@ -174,12 +175,12 @@ node keep-cold.mjs --signals   # consume 429 signals only, no probing
 | `setup.sh` | Interactive and non-interactive auto-setup wizard with VPS hardware sizing |
 | `server.mjs` | Relay: one listener, allowlist, body buffering, attempt loop, `CONNECT`, SSE/no-buffer streaming |
 | `router.mjs` | Lane pool: per-request pick, session stickiness, probe/429 cooldowns, lane pinning for probes |
-| `keep-cold.mjs` | Two-tier 429 prober / rotator for MicroWARP backends (`--once`, `--loop`, `--sweep`, `--signals`) |
+| `keep-cold.mjs` | Rotation controller for MicroWARP backends: liveness probes plus the client-reported 429 path (`--once`, `--loop`, `--sweep`, `--signals`, `--watch-signals`) |
 | `docker-compose.yml` | N × MicroWARP + relay app; one tunnel appended only by `--with-tunnels` |
 | `Dockerfile` / `package.json` | Relay image (COPY-baked) / dependencies |
 | `generate-compose.sh` | Regenerate `docker-compose.yml`: `[count] [--with-tunnels] [--legacy-warp]` |
 | `get-status.sh` | Status script: egress IPs and the one client URL |
-| `systemd/` | systemd service units and timers for keep-cold, its signal pass, and logwatch |
+| `systemd/` | systemd service units and timers for keep-cold, its signal watcher, and logwatch |
 | `docs/` | Step-by-step technical guides (01–07) |
 | `warp-lite/` | Minimal MicroWARP image source (Alpine WireGuard + microsocks, ~1.8 MiB runtime) |
 

@@ -252,6 +252,7 @@ cat <<ENTRY
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
+      - RELAY_SIGNAL_TOKEN=${RELAY_SIGNAL_TOKEN:-}
     volumes:
       - ./.keep-cold:/signals
     networks:
@@ -285,6 +286,7 @@ cat <<ENTRY
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
+      - RELAY_SIGNAL_TOKEN=${RELAY_SIGNAL_TOKEN:-}
     volumes:
       - ./.keep-cold:/signals
     networks:

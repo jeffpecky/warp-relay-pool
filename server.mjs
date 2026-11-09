@@ -55,16 +55,17 @@ function secretEquals(given, expected) {
 // Parse the relay's own Basic gate once: the connect path and the request path
 // both need the decoded credentials, not just a yes/no.
 //
-// Two accepted shapes: the exact configured "user:pass", and "lane-N:pass"
-// with the same password half. The second exists so keep-cold — which must
-// name the lane it measures — can pin through the proxy userinfo; it is not a
-// weaker gate, because the password half must still match exactly, and a
-// caller who has it could already send the exact shape anyway.
+// Three accepted shapes, all requiring the same password half:
+//   "user:pass"          the exact configured credential
+//   "lane-N:pass"        a keep-cold probe pinning the lane it measures
+//   "c-<id>:pass"        a client naming itself so its tunnels share one lane
+// The two non-exact shapes are not a weaker gate: the password half must still
+// match exactly, and a caller who has it could already send the exact shape.
 function proxyAuthInfo(req) {
-  if (!RELAY_PROXY_AUTH) return { ok: true, user: null, pass: null };
+  if (!RELAY_PROXY_AUTH) return { ok: true, user: null, pass: null, clientId: null };
   const header = String(req.headers["proxy-authorization"] || "");
   const space = header.indexOf(" ");
-  if (!/^basic$/i.test(header.slice(0, space).trim())) return { ok: false, user: null, pass: null };
+  if (!/^basic$/i.test(header.slice(0, space).trim())) return { ok: false, user: null, pass: null, clientId: null };
   const decoded = Buffer.from(header.slice(space + 1), "base64").toString("utf8");
   const colon = decoded.indexOf(":");
   const user = colon < 0 ? decoded : decoded.slice(0, colon);
@@ -73,10 +74,11 @@ function proxyAuthInfo(req) {
     ? RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1)
     : "";
   const laneForm = /^lane-\d+$/.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
-  if (!laneForm && !secretEquals(decoded, RELAY_PROXY_AUTH)) {
-    return { ok: false, user: null, pass: null };
+  const clientForm = CLIENT_ID_RE.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
+  if (!laneForm && !clientForm && !secretEquals(decoded, RELAY_PROXY_AUTH)) {
+    return { ok: false, user: null, pass: null, clientId: null };
   }
-  return { ok: true, user, pass };
+  return { ok: true, user, pass, clientId: clientForm ? user : null };
 }
 
 // A missing or non-numeric knob takes the documented default; so does an
@@ -90,6 +92,24 @@ function laneEnv(name, fallback, { allowZero = false, passthrough = false } = {}
   if (allowZero) return n <= 0 ? 0 : n;
   return n < 1 ? fallback : n;
 }
+
+// Client-reported rate limits. The relay cannot see upstream status on a
+// CONNECT tunnel — the request is TLS to the origin and this process only
+// forwards bytes — so the only process that knows a 429 happened is the client
+// that terminated that TLS itself. It reports out of band here, and the relay
+// resolves WHICH egress to condemn: the client names itself, never a lane.
+//
+// No token means the route does not exist (404), so an install that does not
+// report exposes no new surface. The token is a shared secret between the relay
+// and its own client; it is compared in constant time like every other secret.
+const RELAY_SIGNAL_TOKEN = process.env.RELAY_SIGNAL_TOKEN || "";
+const SIGNAL_PATH = "/__signal";
+const SIGNAL_BODY_MAX = 8 * 1024;
+// A self-declared client id is a grouping key, not a capability: it can only
+// place the caller in a lane, and the password (or an open relay) is what
+// authorizes that. Restricted to a shape that cannot smuggle a separator into
+// the sticky key or a newline into a log line.
+const CLIENT_ID_RE = /^c-[A-Za-z0-9_-]{1,64}$/;
 
 const RETRY_MAX = laneEnv("RELAY_LANE_RETRY_MAX", 3, { allowZero: true });
 const RETRY_MAX_BODY = laneEnv("RELAY_LANE_RETRY_MAX_BODY", 1048576);
@@ -156,12 +176,17 @@ function isAuthorized(req, match) {
   return secretEquals(req.headers[HEADER_AUTH], RELAY_AUTH_TOKEN);
 }
 
-// Live rate-limit signals: report the egress/model that just answered 429 so
-// keep-cold can rotate only what is actually throttled. Off by default — the
-// probe scheduler stays the fallback.
+// Live rate-limit signals. Two writers share this sink:
+//   - the L7 forward-proxy path, which reads the status itself (below), and
+//   - the client report endpoint, which exists because a CONNECT tunnel hides
+//     that status from this process (see handleSignal).
+// Setting RELAY_SIGNAL_TOKEN implies the writer: a report that only cools a lane
+// in memory leaves the throttled container running, and making the operator set
+// a second knob to get the durable half is how a silent half-config happens.
 const LIVE_SIGNALS = process.env.LIVE_SIGNALS === "1";
 const LIVE_SIGNAL_FILE = process.env.LIVE_SIGNAL_FILE || ".keep-cold/signals.json";
-const signalWriter = LIVE_SIGNALS ? createSignalWriter({ file: LIVE_SIGNAL_FILE }) : null;
+const signalWriter =
+  LIVE_SIGNALS || RELAY_SIGNAL_TOKEN ? createSignalWriter({ file: LIVE_SIGNAL_FILE }) : null;
 // Enough to cover a chat-completions preamble (stream flags, tool schemas) on
 // every real client; the model field appears before the first message.
 const MODEL_SCAN_BYTES = 16 * 1024;
@@ -360,6 +385,86 @@ const lanes = createLanes({
 
 let inflight = 0;
 
+// The blind spot this endpoint exists for: on a CONNECT tunnel the relay pipes
+// bytes and never sees the origin's status, so a 429 that the client observed
+// would otherwise go unreported and the throttled egress would keep serving.
+// The client names itself; the relay maps that to the lane it has bound and
+// cools it, which drops the binding so the next tunnel rotates.
+//
+// Deliberately lane-free: the client must never be able to choose an egress.
+// Keep it that way — accepting a lane number here would hand any client holding
+// the signal token the ability to park arbitrary lanes.
+async function handleSignal(req, res) {
+  if (!RELAY_SIGNAL_TOKEN) {
+    res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+    return res.end("Not Found\n");
+  }
+  if (!secretEquals(req.headers.authorization || "", `Bearer ${RELAY_SIGNAL_TOKEN}`)) {
+    res.writeHead(401, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "Unauthorized" }));
+  }
+
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > SIGNAL_BODY_MAX) {
+      res.writeHead(413, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ error: "Signal too large" }));
+    }
+    chunks.push(chunk);
+  }
+
+  let body;
+  try {
+    body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    res.writeHead(400, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "Invalid JSON" }));
+  }
+
+  const clientId = body?.clientId;
+  const status = body?.status;
+  if (typeof clientId !== "string" || !CLIENT_ID_RE.test(clientId)) {
+    res.writeHead(400, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "Invalid clientId" }));
+  }
+  // Same two verdicts signal-writer records; anything else is a client bug.
+  if (status !== 429 && status !== 200) {
+    res.writeHead(400, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ error: "status must be 429 or 200" }));
+  }
+
+  const key = `c:${clientId}`;
+  const lane = lanes.heldFor(key);
+  if (!lane) {
+    // Nothing to condemn: the client has not been served a lane yet, or its
+    // binding already expired. Acknowledge rather than error — a report that
+    // lost the race must not look like a client failure.
+    res.writeHead(204);
+    return res.end();
+  }
+
+  const model = typeof body?.model === "string" && body.model ? body.model.slice(0, 200) : "";
+  const retryAfter = Number(body?.retryAfter) || null;
+  if (status === 429) {
+    // "signal" picks cool429Until, leaving the probe-driven cooldown untouched:
+    // a reported throttle must not be confused with a connect failure.
+    lanes.cool(lane, LANE_COOLDOWN_429_MS, `429 reported by ${clientId}`, "signal");
+  } else {
+    // Recovery: clear the throttle cooldown so the lane is selectable again.
+    lane.cool429Until = 0;
+    lanes.bind(key, lane);
+    console.log(`[relay #${lane.n}] 429 cleared by ${clientId}`);
+  }
+  // Durable half: keep-cold --signals turns this record into a container
+  // restart. Without it the report would only steer this process's memory.
+  signalWriter?.record({ relay: lane.n, model, status, retryAfter });
+
+  res.writeHead(204);
+  res.end();
+}
+
 const server = http.createServer(async (req, res) => {
   // A client that vanishes mid-response must not surface as an unhandled
   // 'error' event on either side.
@@ -375,8 +480,21 @@ const server = http.createServer(async (req, res) => {
     inflight -= 1;
   });
 
-  const key = laneKey(req.headers, req.socket?.remoteAddress || "");
+  // Matched on the exact request line, before any proxy handling, so it can
+  // never be read as an absolute-form dispatch to an upstream origin.
+  if (req.method === "POST" && req.url === SIGNAL_PATH) {
+    try {
+      await handleSignal(req, res);
+    } catch (err) {
+      console.error(`[relay] signal handler failed: ${err?.stack ?? String(err)}`);
+      if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal error" }));
+    }
+    return;
+  }
+
   const auth = proxyAuthInfo(req);
+  const key = laneKey(req.headers, req.socket?.remoteAddress || "", auth.clientId);
 
   let target = req.headers[HEADER_TARGET]?.replace(/\/$/, "");
   let relayPath = req.headers[HEADER_PATH] || "/";
@@ -628,7 +746,14 @@ const server = http.createServer(async (req, res) => {
 
     // A pinned lane is a measurement, not a preference: binding it to the
     // sticky key would drag a probed session's later real traffic onto it.
-    if (upstream.status !== 429 && !pinned) lanes.bind(key, lane);
+    // A real 200 on a lane is proof the egress answers now, which beats the
+    // guess a 429 timestamp makes — so it lifts that lane's 429 cooldown at
+    // once. Without this, a lane whose container was just restarted still sits
+    // parked for RELAY_LANE_429_S while the pool has nothing else to serve.
+    if (upstream.status !== 429) {
+      lane.cool429Until = 0;
+      if (!pinned) lanes.bind(key, lane);
+    }
 
     // Forward only what the client needs: full header copies cost per-request
     // work and risk stale content-encoding/content-length (fetch decodes
@@ -753,7 +878,7 @@ server.on("connect", (req, clientSocket, head) => {
     lanes,
     proxyAuth: RELAY_PROXY_AUTH,
   });
-  const lane = pinned || lanes.pick(laneKey(req.headers, clientSocket.remoteAddress || ""));
+  const lane = pinned || lanes.pick(laneKey(req.headers, clientSocket.remoteAddress || "", auth.clientId));
   if (!lane) {
     deny(503, "Service Unavailable");
     return;
@@ -805,6 +930,14 @@ server.on("error", (err) => {
 
 server.listen(BASE_PORT, "0.0.0.0", () => {
   console.log(`listening on 0.0.0.0:${BASE_PORT} -> ${COUNT} lane(s)`);
+  // A `c-<id>` client needs a non-empty password half to authenticate at all,
+  // and the failure looks like a client bug rather than a config one.
+  if (RELAY_SIGNAL_TOKEN && RELAY_PROXY_AUTH.includes(":")) {
+    const wantPass = RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1);
+    if (wantPass === "") {
+      console.error("[relay] RELAY_PROXY_AUTH has an empty password half: `c-<id>` clients cannot authenticate.");
+    }
+  }
   // Without this nothing probes: sick lanes would never be parked or
   // re-admitted, and RELAY_LANE_PROBE_S would be a no-op knob.
   lanes.start();

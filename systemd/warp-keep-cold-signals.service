@@ -1,29 +1,36 @@
 # Install (Docker Linux host):
-#   1. Copy this file to /etc/systemd/system/warp-keep-cold-signals.service
-#      (and .timer alongside it).
+#   1. Copy this file to /etc/systemd/system/warp-keep-cold-signals.service.
 #   2. Edit the User=/Group=/WorkingDirectory=/Environment=/ExecStart=
-#      paths below. Defaults assume the repo lives at
-#      /opt/warp-relay-pool — adjust if you cloned it elsewhere.
-#   3. systemctl daemon-reload && systemctl enable --now warp-keep-cold-signals.timer
+#      paths below. Defaults assume the repo lives at /opt/warp-relay-pool —
+#      adjust if you cloned it elsewhere.
+#   3. systemctl daemon-reload && systemctl enable --now warp-keep-cold-signals.service
+#
+# This unit used to be a oneshot fired by a one-minute timer. On a 2-3 lane pool
+# that minute is the whole problem: the lanes still serving are the only ones
+# left, and the restarted lane could already be back. The watcher reacts to the
+# signal-file write instead — measured in milliseconds — so the timer is gone.
+# Its poll fallback (WATCH_POLL_MS, default 2s) covers platforms where fs.watch
+# misses a rename, so nothing depends on the fast path being available.
 # Template note: for a user instance (systemd --user), replace User=/Group=
 # with User=%i as warp-keep-cold.service does.
 [Unit]
-Description=Consume relay 429 signals and rotate the named egress
+Description=Watch relay 429 signals and rotate the named egress
 Documentation=file:/opt/warp-relay-pool/keep-cold.mjs
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 # Edit to the user that owns the checkout (required for system units).
 User=warp-relay
 Group=warp-relay
-# The signals pass shells out to `docker restart` for every rotation.
+# A rotation shells out to `docker restart`.
 SupplementaryGroups=docker
 WorkingDirectory=/opt/warp-relay-pool
-# One pass reads the signal file and rotates the relays it names; it never
-# probes, so it is bounded by the rotations themselves, not by pool size.
-TimeoutStartSec=900
+# A signal-file write triggers one pass; a bad report must not end the watcher,
+# so a crash restarts it rather than leaving 429s unreported forever.
+Restart=always
+RestartSec=3
 # Pool size: the named relays must exist for a rotation to land.
 Environment=COUNT=10
 # The single relay port keep-cold reports through (also its probe target in
@@ -32,9 +39,13 @@ Environment=BASE_PORT=3000
 # Direct public-IP ingress: the prober must present the Basic proxy
 # credentials (setup.sh rewrites this line; empty in mesh/tunnels installs).
 Environment=RELAY_PROXY_AUTH=
-# -E 0: a skipped pass (the sweep holds the lock) is contention, not failure.
-# The shared lock makes a signals pass and a full sweep mutually exclusive,
-# so a sweep never rotates a relay out from under a signal mid-pass.
-ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock /usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --signals
+# Run the watcher, not a timer-driven pass. It watches the signal file and, on
+# every write, spawns the same locked one-pass worker the timer used to launch.
+#
+# Deliberately NOT wrapped in flock for the process lifetime: a long-running
+# unit holding /tmp/warp-keep-cold.lock would make every full sweep skip
+# forever. The child worker takes the lock itself, per pass, exactly as the
+# timer-driven service did.
+ExecStart=/usr/bin/node /opt/warp-relay-pool/keep-cold.mjs --watch-signals
 StandardOutput=journal
 StandardError=journal

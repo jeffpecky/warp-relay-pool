@@ -703,8 +703,9 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
         -e "s|^Description=.*|Description=Run the WARP keep-cold full sweep every ${SWEEP_INTERVAL_MIN} minutes|" \
         systemd/warp-keep-cold.timer > "$TMP_COLD_TIMER"
 
-    # The signals pass runs every minute and shares the sweep's lock, so a
-    # 429 on one lane is acted on long before the next full sweep.
+    # The signals watcher runs for the life of the host and spawns the locked
+    # one-pass worker on every signal-file write, so a 429 is acted on in
+    # milliseconds rather than waiting for the next minute tick.
     TMP_SIGNALS="$(mktemp)"
     sed -e "s|^User=.*|User=${CURRENT_USER}|" \
         -e "s|^Group=.*|Group=${CURRENT_GROUP}|" \
@@ -713,7 +714,7 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
         -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
         -e "s|^Environment=BASE_PORT=.*|Environment=BASE_PORT=${BASE_PORT:-3000}|" \
         -e "s|^Environment=RELAY_PROXY_AUTH=.*|Environment=RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH:-}|" \
-        -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --signals|" \
+        -e "s|^ExecStart=.*|ExecStart=${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --watch-signals|" \
         systemd/warp-keep-cold-signals.service > "$TMP_SIGNALS"
 
     TMP_WATCH="$(mktemp)"
@@ -728,12 +729,12 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
     if run_elevated cp "$TMP_KEEP" /etc/systemd/system/warp-keep-cold.service \
        && run_elevated cp "$TMP_COLD_TIMER" /etc/systemd/system/warp-keep-cold.timer \
        && run_elevated cp "$TMP_SIGNALS" /etc/systemd/system/warp-keep-cold-signals.service \
-       && run_elevated cp systemd/warp-keep-cold-signals.timer /etc/systemd/system/warp-keep-cold-signals.timer \
+       && run_elevated rm -f /etc/systemd/system/warp-keep-cold-signals.timer \
        && run_elevated cp "$TMP_WATCH" /etc/systemd/system/warp-logwatch.service \
        && run_elevated cp systemd/warp-logwatch.timer /etc/systemd/system/warp-logwatch.timer \
        && run_elevated systemctl daemon-reload \
-       && run_elevated systemctl enable --now warp-keep-cold.timer warp-keep-cold-signals.timer warp-logwatch.timer; then
-      log_ok "Keep-cold full sweep every ${SWEEP_INTERVAL_MIN} minutes + signal consumption every minute + logwatch active (COUNT=${COUNT})."
+       && run_elevated systemctl enable --now warp-keep-cold.timer warp-keep-cold-signals.service warp-logwatch.timer; then
+      log_ok "Keep-cold full sweep every ${SWEEP_INTERVAL_MIN} minutes + signal watcher + logwatch active (COUNT=${COUNT})."
     else
       log_warn "systemd units were not installed; run 'node keep-cold.mjs --sweep' manually or re-run with sudo."
     fi
@@ -759,8 +760,8 @@ echo "Health check (returns the egress IP of whichever lane answered):"
 echo "  curl -s -x <relay-url> https://cloudflare.com/cdn-cgi/trace"
 echo ""
 echo "Rotation: warp-keep-cold.timer sweeps all ${COUNT} relays every"
-echo "   ${SWEEP_INTERVAL_MIN} minutes, and warp-keep-cold-signals.timer consumes"
-echo "   429 signals every minute so a freshly throttled egress is rotated"
+echo "   ${SWEEP_INTERVAL_MIN} minutes, and warp-keep-cold-signals.service watches"
+echo "   429 signals as they land, so a freshly throttled egress is rotated"
 echo "   long before the next sweep. A rotated relay gets a new egress and"
 echo "   rejoins the pool automatically."
 echo "======================================================================="

@@ -44,12 +44,20 @@ export function resolvePinnedLane({ headers = {}, proxyUser, proxyPass, lanes, p
   return byIndex(m[1]);
 }
 
-export function laneKey(headers = {}, peerAddress = "") {
+// Cache key for sticky lane selection. Headers win because they are what the
+// L7 path already keys on, so nothing changes there. `clientId` is next: a
+// CONNECT tunnel carries no relay headers at all, so without it every tunnel
+// from one host collapses onto the peer address and holds a single lane for
+// the process lifetime — the pool never spreads. The id arrives in the proxy
+// userinfo (`c-<id>:<pass>`), which is the only field an authenticating CONNECT
+// client can vary.
+export function laneKey(headers = {}, peerAddress = "", clientId = "") {
   const h = headers || {};
   for (const name of ["x-opencode-session", "x-session-affinity", "x-session-id"]) {
     const v = h[name];
     if (typeof v === "string" && v.trim()) return v.trim();
   }
+  if (typeof clientId === "string" && clientId) return `c:${clientId}`;
   return String(peerAddress || "").trim() || "unknown";
 }
 
@@ -108,7 +116,10 @@ export async function readReplayableBody(req, maxBytes) {
   }
 }
 
-// Real health path: the same GET / a client's lane would answer.
+// Real health path: the same GET / a client's lane would answer. Reports the
+// egress IP as well as the verdict: a 429 cools a lane for a fixed window, but
+// the IP is what actually defines the throttled bucket, so a probe that sees a
+// DIFFERENT address proves the old verdict is stale (see runProbe).
 function defaultProbeFactory() {
   const port = parseInt(process.env.BASE_PORT ?? "", 10) || 3000;
   return (lane) =>
@@ -122,12 +133,22 @@ function defaultProbeFactory() {
           headers: { "x-relay-lane": String(lane.n), "x-keep-cold-probe": "1" },
         },
         (res) => {
-          res.resume();
-          resolve(res.statusCode === 200);
+          let body = "";
+          res.setEncoding("utf8");
+          res.on("data", (d) => {
+            // The trace body is a short block of `key=value` lines; the cap only
+            // stops a misconfigured upstream from filling this array.
+            if (body.length < 4096) body += d;
+          });
+          res.on("end", () => {
+            if (res.statusCode !== 200) return resolve({ ok: false, ip: null });
+            const ip = /(?:^|\n)ip=([^\s]+)/.exec(body)?.[1] ?? null;
+            resolve({ ok: true, ip });
+          });
         }
       );
       req.on("timeout", () => req.destroy(new Error("probe timeout")));
-      req.on("error", () => resolve(false));
+      req.on("error", () => resolve({ ok: false, ip: null }));
     });
 }
 
@@ -160,6 +181,10 @@ export function createLanes({
       sick: false,
       probeOutUntil: 0,
       cool429Until: 0,
+      // Last address this lane was observed serving from, and the one that
+      // earned the current 429 cooldown. Only a change between them lifts it.
+      ip: null,
+      cooledIp: null,
       inflight: 0,
     };
   });
@@ -219,6 +244,10 @@ export function createLanes({
     // Two independent lanes: a signal cooldown never touches the probe lane.
     const field = kind === "signal" ? "cool429Until" : "probeOutUntil";
     lane[field] = Math.max(lane[field], Date.now() + ms);
+    // Remember which address earned the 429 verdict. It is the only evidence
+    // that can lift this cooldown early: the same address answering again is
+    // the same throttle, a different one is a different bucket.
+    if (kind === "signal") lane.cooledIp = lane.ip ?? null;
     dropSticky(lane.n);
     log(`lane #${lane.n}: cooldown ${Math.round(ms / 1000)}s (${why})`);
   }
@@ -227,18 +256,42 @@ export function createLanes({
   async function runProbe(lane) {
     if (probing.has(lane.n)) return;
     probing.add(lane.n);
-    let ok = false;
+    let out = { ok: false, ip: null };
     try {
-      ok = await probe(lane);
+      // Older/custom probe factories return a bare boolean; accept both so the
+      // lane protocol stays a one-value answer for anyone supplying their own.
+      const res = await probe(lane);
+      out = typeof res === "boolean" ? { ok: res, ip: null } : res ?? out;
     } catch {
-      ok = false;
+      out = { ok: false, ip: null };
     } finally {
       probing.delete(lane.n);
     }
-    if (ok) {
+    if (out.ok) {
       if (lane.sick) log(`lane #${lane.n}: probe OK, re-admitted`);
       lane.sick = false;
       lane.probeOutUntil = 0;
+      // A 429 cooldown is a verdict on the ADDRESS that produced it. A probe
+      // that answers 200 from a different address therefore proves the old
+      // verdict stale — the restart already did its job — and the lane goes
+      // back into the pool on evidence instead of waiting out a timer. Without
+      // this, a small pool (2-3 lanes) stays short of usable lanes for a whole
+      // RELAY_LANE_429_S after every restart, which is exactly when a long task
+      // needs them.
+      if (lane.cool429Until > 0) {
+        if (out.ip && lane.cooledIp && out.ip !== lane.cooledIp) {
+          const was = lane.cooledIp;
+          lane.cool429Until = 0;
+          lane.cooledIp = null;
+          log(`lane #${lane.n}: probe OK from ${out.ip} (was ${was}) — 429 cooldown lifted`);
+        } else if (!out.ip) {
+          // No address in the probe answer: a 200 still means the egress serves.
+          lane.cool429Until = 0;
+          lane.cooledIp = null;
+          log(`lane #${lane.n}: probe OK — 429 cooldown lifted`);
+        }
+      }
+      if (out.ip) lane.ip = out.ip;
     } else {
       lane.sick = true;
       cool(lane, cooldownMs, "probe failed");
@@ -257,6 +310,14 @@ export function createLanes({
     });
   }
 
+  // The lane a key is currently bound to, parked or not. `pick()` skips parked
+  // lanes, so it cannot answer "which lane did this client's last request use" —
+  // and that is precisely the lane a throttling report has to condemn. Returns
+  // null when the key has no binding yet.
+  function heldFor(key) {
+    return (key && sticky.get(key)) || null;
+  }
+
   function stop() {
     for (const t of timers.splice(0)) {
       clearInterval(t);
@@ -269,6 +330,7 @@ export function createLanes({
     pick,
     bind,
     cool,
+    heldFor,
     start,
     stop,
     stickySize: () => sticky.size,

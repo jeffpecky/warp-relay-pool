@@ -18,8 +18,9 @@ The interactive wizard handles everything automatically:
 - Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot**.
 - Builds the minimal MicroWARP image (`warp-lite:latest`, ~1.8 MiB RAM/node).
 - Deploys TryCloudflare Quick Tunnels (public HTTPS URL, zero client VPN needed) or Mesh-VPN direct.
-- Installs `warp-keep-cold.timer` (full sweep), `warp-keep-cold-signals.timer`
-  (429 consumption every minute) and `warp-logwatch.timer`.
+- Installs `warp-keep-cold.timer` (full sweep), `warp-keep-cold-signals.service`
+  (a signal watcher that reacts to a 429 report in milliseconds) and
+  `warp-logwatch.timer`.
 - On an existing deployment, adopts the deployed relay count and ingress
   mode unless `COUNT=`/`INGRESS=` are pinned (and removes orphan containers
   when the pool shrinks).
@@ -100,26 +101,35 @@ default naming needs no configuration.
 ```bash
 node keep-cold.mjs --once       # one pass now; exit 0 only when every relay is clean
 sudo cp systemd/warp-keep-cold.{service,timer} /etc/systemd/system/
-sudo cp systemd/warp-keep-cold-signals.{service,timer} /etc/systemd/system/
+sudo cp systemd/warp-keep-cold-signals.service /etc/systemd/system/
 # edit User=/WorkingDirectory=/ExecStart= AND Environment=COUNT=/BASE_PORT=
 # to match the deployed pool (setup.sh does this automatically), then:
 sudo systemctl daemon-reload
-sudo systemctl enable --now warp-keep-cold.timer warp-keep-cold-signals.timer
+sudo systemctl enable --now warp-keep-cold.timer warp-keep-cold-signals.service
 ```
 
-Two timers, one lock:
+One timer plus one watcher, one lock:
 
 - `warp-keep-cold.timer` runs the **full sweep** every 5 minutes (15 above 10
   relays). Probing is demand-driven and a relay is restarted at most once per
   `RELAY_COOLDOWN_S`, so later passes are short.
-- `warp-keep-cold-signals.timer` runs `keep-cold.mjs --signals` every minute.
-  It never probes: it reads `.keep-cold/signals.json`, which the relay writes
-  the moment an upstream answers 429, and rotates the lanes it names. That is
-  how a freshly throttled egress is repaired long before the next sweep.
+- `warp-keep-cold-signals.service` is a long-running watcher, not a timer. It
+  watches `.keep-cold/signals.json` — written the moment an upstream answers
+  429 — and on every write spawns `keep-cold.mjs --signals`, which never probes
+  and rotates the lanes it names. A 429 is therefore acted on in milliseconds,
+  which matters on a 2-3 lane pool where a single minute of waiting leaves the
+  remaining lanes carrying everything.
 
-Both are `Type=oneshot` and take `/tmp/warp-keep-cold.lock`, so an overlapping
-fire is contention, not failure (`flock -n -E 0`), and a signals pass never
-runs concurrently with a sweep.
+The watcher process itself holds no lock; each child pass takes
+`/tmp/warp-keep-cold.lock` exactly as the old timer-driven service did. Holding
+the lock for the watcher's lifetime would make every full sweep skip forever.
+That makes an overlapping pass contention, not failure (`flock -n -E 0`), and a
+signals pass never runs concurrently with a sweep, nor two signals passes with
+each other.
+
+Tuning: `WATCH_DEBOUNCE_MS` (default 250) collapses a burst of reports into one
+pass; `WATCH_POLL_MS` (default 2000) is the portable fallback for platforms
+where `fs.watch` misses a rename.
 
 Exit status: `0` = every relay clean; `1` = a relay is still hot, a
 server_error held, a 502 did not recover, a relay was just rotated and is

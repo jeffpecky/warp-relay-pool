@@ -25,7 +25,10 @@ Routing policy, all client-invisible:
   (default 120s) so traffic hops to a sibling egress while keep-cold does the
   slower real repair. When every lane is parked by 429s the request is served
   through one anyway — a throttle is not a broken egress, and a fleet-wide
-  `503` is worse than a throttled attempt.
+  `503` is worse than a throttled attempt. On the L7 path the relay reads the
+  status itself; inside a `CONNECT` tunnel it cannot, so a TLS-terminating
+  client reports the verdict to `POST /__signal` (see
+  [07-single-url-router.md](07-single-url-router.md#reported-429s-the-control-path)).
 - **Session-sticky:** requests sharing a session header stay on the lane they
   used, with no TTL, so reasoning-issuer affinity holds per session.
 - **All-egress outage:** with no lane usable at all the router answers plain
@@ -114,9 +117,11 @@ the relay:
   public capability — treat it as a secret once a wildcard entry exists, and
   rotate the token by regenerating (`RELAY_AUTH_TOKEN=<new>
   ./generate-compose.sh … && docker compose up -d --build relay`).
-- Quota note: 429 rotation and the keep-cold probe lane still target
-  `PROBE_TARGET` (OpenCode Zen) only — universal traffic rides the same
-  egress IPs but does not extend probing to new upstreams.
+- Quota note: keep-cold's probe lane still targets `PROBE_TARGET` (OpenCode
+  Zen) only, and a probe 429 is liveness evidence, not a rotation trigger.
+  Universal traffic rides the same egress IPs but does not extend probing to
+  new upstreams; a throttle seen on another upstream reaches the pool only if
+  that client reports it.
 
 ## Direct public-IP ingress (wizard option)
 

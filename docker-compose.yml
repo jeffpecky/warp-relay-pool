@@ -300,6 +300,7 @@ services:
       - RELAY_AUTH_TOKEN=
       - LIVE_SIGNALS=0
       - LIVE_SIGNAL_FILE=/signals/signals.json
+      - RELAY_SIGNAL_TOKEN=
     volumes:
       - ./.keep-cold:/signals
     networks:

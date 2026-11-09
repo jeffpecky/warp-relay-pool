@@ -115,8 +115,10 @@ test("a failing probe marks the lane sick and parks it", async () => {
 });
 
 test("a passing probe clears only its own lane", async () => {
+  // The probe answers without an address, which is the only case where a bare
+  // 200 can lift a 429 cooldown; an address that MATCHES the cooled one must
+  // not (see the tests below).
   const p = pool(2, { probe: async (l) => l.n === 1, probeIntervalMs: 5 });
-  // Start from a parked lane so "cleared" can only come from the probe passing.
   p.lanes[0].sick = true;
   p.lanes[0].probeOutUntil = Date.now() + 60_000;
   p.lanes[0].cool429Until = Date.now() + 60_000;
@@ -125,8 +127,33 @@ test("a passing probe clears only its own lane", async () => {
     await new Promise((r) => setTimeout(r, 80));
     assert.equal(p.lanes[0].sick, false, "the pass re-admits the lane");
     assert.equal(p.lanes[0].probeOutUntil, 0, "the pass clears the probe cooldown");
-    assert.ok(p.lanes[0].cool429Until > Date.now() + 50_000, "the 429 lane survives a passing probe");
+    assert.equal(p.lanes[0].cool429Until, 0, "a probe that cannot see an address trusts its 200");
     assert.equal(p.lanes[1].sick, true, "the failing lane is untouched by lane 1's pass");
+  } finally {
+    p.stop();
+  }
+});
+
+test("a probe from a new address lifts the 429 cooldown; the same address does not", async () => {
+  let servedFrom = "2001:db8:1::1";
+  const p = pool(1, { probe: async () => ({ ok: true, ip: servedFrom }), probeIntervalMs: 5 });
+  const lane = p.lanes[0];
+
+  // The 429 was earned from ::1, so a probe still seeing ::1 proves nothing.
+  lane.ip = "2001:db8:1::1";
+  p.cool(lane, 120_000, "429 reported", "signal");
+  p.start();
+  try {
+    await new Promise((r) => setTimeout(r, 60));
+    assert.ok(lane.cool429Until > Date.now(), "same address keeps the cooldown");
+    // pick() still serves a parked lane when nothing else is usable (a single
+    // lane must not 503), so the cooldown itself is the evidence, not pick().
+
+    // The container was restarted: same lane, different exit IP.
+    servedFrom = "2001:db8:2::1";
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(lane.cool429Until, 0, "a different address proves the verdict stale");
+    assert.equal(p.pick("k")?.n, 1, "the lane is back in the pool without waiting out the timer");
   } finally {
     p.stop();
   }

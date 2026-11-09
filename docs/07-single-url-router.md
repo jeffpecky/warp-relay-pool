@@ -65,6 +65,7 @@ origins do not. Setup and the full allowlist grammar:
 | Every lane is parked by `429` | Traffic is still served through one of them — a throttle is not a dead egress. |
 | Every lane is parked by a failed probe | `503` with `Retry-After: 30`. A genuinely empty pool, not a throttle. |
 | An upstream `5xx` on a `POST` | Returned as-is. A `POST` is never replayed after a `502`/`503`/`504`; only `GET`/`HEAD` are. |
+| A `CONNECT` client reports its own `429` | The lane it was bound to is cooled immediately and its next tunnel rotates; the report also reaches `LIVE_SIGNAL_FILE`, so the container restarts. See "Reported 429s" below. |
 | Target not in the allowlist | `403 {"error":"Forbidden target"}`. |
 
 ## Affinity
@@ -75,7 +76,39 @@ the same `x-opencode-session` / `x-session-affinity` / `x-session-id` header
 land on the same lane, with no TTL. Without a session header the key falls back
 to the peer address.
 
+A `CONNECT` tunnel carries none of those headers, so an authenticating client
+may name itself in the proxy userinfo instead (`c-<id>:<pass>`). The stickiness
+key becomes `c:<id>`, which is the only way the pool can spread one host's
+tunnels across lanes instead of collapsing them onto its peer address forever.
+The password half is still the trust boundary.
+
 A lane that 429s or fails is cooled and the client fails over; the sticky pin
 moves with it. When every lane is exhausted by 429s, the request is served
 through a throttled lane rather than rejected — the alternative is answering
 `503` to the whole fleet for the duration of the cooldown window.
+
+## Reported 429s (the control path)
+
+The relay cannot read a status inside a `CONNECT` tunnel: it forwards raw
+bytes, and the TLS is terminated by the client. A client that does terminate
+TLS (zen-proxy) therefore reports the verdict out of band:
+
+```
+POST /__signal                     (same host and port as the proxy)
+authorization: Bearer <RELAY_SIGNAL_TOKEN>
+{ "clientId": "c-<id>", "status": 429, "model": "…", "retryAfter": 30 }
+```
+
+- The report names the **client**, never a lane. The relay looks up the lane
+  that client id is bound to and cools it; a client cannot choose an egress.
+- Unset `RELAY_SIGNAL_TOKEN` ⇒ the endpoint answers `404`, so an install that
+  does not use signalling exposes no new surface. Wrong token ⇒ `401`.
+- The cooling is immediate (the next tunnel from that client rotates), and the
+  same report is written to `LIVE_SIGNAL_FILE`, which is what restarts the
+  container onto a fresh exit IP.
+- `status: 200` clears the cooldown: a subsequent success on the lane is
+  evidence the egress serves again.
+- A lane's 429 cooldown is also lifted by the lane probe when it answers `200`
+  from a **different** egress IP — the restarted container already did its job,
+  so there is no reason to wait out `RELAY_LANE_429_S`. The same IP answering
+  again proves nothing and keeps the cooldown.
