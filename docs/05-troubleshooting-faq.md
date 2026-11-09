@@ -68,11 +68,33 @@ does not answer within `HANDSHAKE_WAIT_S` (default 12 s), it retries
 alternates with the same keys and re-pins the host route for each — no extra
 Cloudflare registrations. `HANDSHAKE_FAILOVER=0` disables it.
 
+**HTTPS stalls but plain HTTP works (small host uplink MTU).** If a client
+can reach a lane and plain HTTP succeeds, but every HTTPS request hangs during
+the TLS handshake, the host's own path MTU is smaller than the lane's. The
+lane's WireGuard packet is `MTU` inner bytes plus 60–80 outer bytes; if that
+exceeds the host uplink it is dropped, and the first victim is the large TLS
+`ClientHello`. Check and fix on the host:
+
+```sh
+cat /sys/class/net/<uplink>/mtu          # 1500 is normal; 1280 is the problem
+ping -c1 -M do -s 1400 1.1.1.1           # "Message too long"/100% loss = too big
+ip link set dev <uplink> mtu 1500        # raise the uplink, do NOT lower WARP_MTU
+```
+
+Do **not** lower `WARP_MTU` to compensate. Every lane is dual-stack, an IPv6
+interface cannot carry an MTU below 1280 (RFC 8200), and `wg-quick` then fails
+on `ip -6 route add ::/0` — the lane crash-loops with `RTNETLINK answers: No
+such device`. The generator enforces 1280..1500 for this reason. WSL2's vNIC
+defaults to 1280; raise it on the WSL side and make it persistent, or run the
+pool on a host whose uplink is already 1500.
+
 **Host port already in use.** If `docker compose up` fails binding `3100`
 or `10800+N` (a local service already claims it — `:3102` or `:10802`
 collisions are the classic case), regenerate with a different `BASE_PORT`, or
 edit the `ports:` lines in `docker-compose.yml` (and the generator), then `up`
-again. Only one host port is needed for the router now.
+again. Only one host port is needed for the router now. The router's host port
+itself is `ROUTER_PORT` (default 3100): set it to move that one listener
+without touching the client-visible shape.
 
 **Multi-stack or systemd failures.** Check systemd logs with
 `journalctl -u warp-keep-cold.service -n 50 --no-pager` (or

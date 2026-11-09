@@ -100,22 +100,21 @@ if [ "$RELAY_DIRECT_PUBLIC" = "1" ] && [ -z "$RELAY_PROXY_AUTH" ]; then
   exit 1
 fi
 
-# Inner WireGuard MTU. 1280 is Cloudflare's safe default and correct on a
-# normal 1500-byte uplink. It is NOT safe when the host's own uplink is
-# already 1280 (WSL2, some container hosts): the encapsulated packet then
-# carries a 1280-byte inner payload plus a 60-80 byte outer header, exceeds
-# the uplink, and is dropped — which shows up as a TLS handshake that never
-# completes (small packets pass, a large ClientHello does not) while the lane
-# looks healthy in-container. Lower this to the uplink MTU minus ~80.
+# Inner WireGuard MTU. 1280 is Cloudflare's safe default and the IPv6 minimum
+# (RFC 8200) — every lane is dual-stack by default, and an IPv6 interface
+# cannot carry an MTU below 1280, so a smaller value makes wg-quick fail on
+# `ip -6 route add ::/0` and the lane crash-loop. Do NOT lower this to work
+# around a small host uplink; raise the uplink instead (see docs). Only an
+# IPv4-only lane (ENABLE_IPV6=0) can go below 1280.
 WG_MTU="${WARP_MTU:-1280}"
 case "$WG_MTU" in
   ''|*[!0-9]*)
-    echo "error: WARP_MTU must be an integer 576..1500, got '$WG_MTU'" >&2
+    echo "error: WARP_MTU must be an integer 1280..1500, got '$WG_MTU'" >&2
     exit 1
     ;;
 esac
-if [ "$WG_MTU" -lt 576 ] || [ "$WG_MTU" -gt 1500 ]; then
-  echo "error: WARP_MTU must be within 576..1500, got $WG_MTU" >&2
+if [ "$WG_MTU" -lt 1280 ] || [ "$WG_MTU" -gt 1500 ]; then
+  echo "error: WARP_MTU must be 1280..1500, got $WG_MTU (IPv6 requires >= 1280)" >&2
   exit 1
 fi
 
