@@ -227,8 +227,8 @@ chmod 600 .env
 
 Then set the same value as `RELAY_SIGNAL_TOKEN` in zen-proxy. The client id is
 the client's own choice, not a secret and not relay-generated: zen-proxy reads
-it from `PROXY_URL`'s userinfo (`c-<id>`) when `ZEN_PROXY_CLIENT_ID` is unset,
-so the token plus a `c-<id>` proxy URL is the whole client-side configuration.
+it from `PROXY_URL`'s userinfo (`c-<id>`) — there is no separate setting — so
+the token plus a `c-<id>` proxy URL is the whole client-side configuration.
 
 This path is optional: when the file is absent or corrupt the probe scheduler
 above runs unchanged, so a pool that never enables signals still converges. The

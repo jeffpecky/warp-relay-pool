@@ -101,6 +101,14 @@ authorization: Bearer <RELAY_SIGNAL_TOKEN>
 
 - The report names the **client**, never a lane. The relay looks up the lane
   that client id is bound to and cools it; a client cannot choose an egress.
+- `clientId` is the proxy-auth **username** in its `c-<id>` form. All three
+  accepted userinfo shapes (`user`, `lane-N`, `c-<id>`) need the same password
+  half — the username is a routing label, not a second credential. A client
+  presenting the plain configured user (`runner`, the wizard default) is
+  served normally but has no identity, so its 429s cannot be reported. This is
+  why 429 reporting is enabled by `RELAY_SIGNAL_TOKEN`, not by the username:
+  point `PROXY_URL` at any other rotating proxy with no token and it is a
+  plain proxy, with no control surface here.
 - Unset `RELAY_SIGNAL_TOKEN` ⇒ the endpoint answers `404`, so an install that
   does not use signalling exposes no new surface. Wrong token ⇒ `401`.
 - The cooling is immediate (the next tunnel from that client rotates), and the
