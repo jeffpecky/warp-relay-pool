@@ -6,8 +6,9 @@
 #
 # Default (pure) mode: warp-1..N on minimal MicroWARP (warp-lite: ~1.8 MiB RAM each),
 # each with `ports: "<10800+i>:1080"` (raw proxy), plus one relay app at 10.244.0.100
-# with `ports: "3100:3000"` for mesh-VPN direct ingress. One listener serves the
-# whole pool; a probe names its lane in a header, not by port.
+# with `ports: "<ROUTER_PORT=3100>:3000"` for mesh-VPN direct ingress. One listener
+# serves the whole pool; a probe names its lane in a header, not by port.
+# ROUTER_PORT moves that one public port when 3100 is already taken on the host.
 # With --with-tunnels: appends one tunnel-0 (Quick Tunnel -> http://10.244.0.100:3000).
 # With --legacy-warp: uses caomingjun/warp:latest (~100 MiB each) instead of warp-lite.
 # Rotation rule: restart warp-N only, never tunnel-N/relay.
@@ -99,9 +100,22 @@ if [ "$RELAY_DIRECT_PUBLIC" = "1" ] && [ -z "$RELAY_PROXY_AUTH" ]; then
   exit 1
 fi
 
-HOST_LO=$((3100))
-# One listener serves the whole pool: host 3100 -> container BASE_PORT. There
-# is no per-relay host mapping any more (a probe names its lane in a header).
+HOST_LO="${ROUTER_PORT:-3100}"
+case "$HOST_LO" in
+  ''|*[!0-9]*)
+    echo "error: ROUTER_PORT must be an integer 1..65535, got '$HOST_LO'" >&2
+    exit 1
+    ;;
+esac
+if [ "$HOST_LO" -lt 1 ] || [ "$HOST_LO" -gt 65535 ]; then
+  echo "error: ROUTER_PORT must be <= 65535, got $HOST_LO" >&2
+  exit 1
+fi
+# One listener serves the whole pool: host ROUTER_PORT -> container BASE_PORT.
+# There is no per-relay host mapping any more (a probe names its lane in a
+# header). ROUTER_PORT exists so a host that already uses 3100 (another
+# service, a Docker Desktop forward) can move the one public port without
+# touching the client-visible shape: it is still one URL.
 CONT_LO=$((BASE_PORT))
 
 # Host binds default to loopback: the SOCKS proxies are unauthenticated and
@@ -122,7 +136,7 @@ esac
 if [ "$WITH_TUNNELS" = true ]; then
 ROUTER_LINE="relay router not host-published; tunnels reach it in-network at http://10.244.0.100:300N"
 else
-ROUTER_LINE="relay router (mesh-VPN ingress) on ${ROUTER_BIND}:${HOST_LO} (override bind: INGRESS_BIND)"
+ROUTER_LINE="relay router (mesh-VPN ingress) on ${ROUTER_BIND}:${HOST_LO} (override bind: INGRESS_BIND, port: ROUTER_PORT)"
 fi
 
 {

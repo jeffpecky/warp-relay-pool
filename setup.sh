@@ -328,8 +328,14 @@ if [ -z "${WARP_BIND:-}" ] && [ -f docker-compose.yml ]; then
   [ -n "$WARP_BIND" ] && export WARP_BIND
 fi
 if [ -z "${INGRESS_BIND:-}" ] && [ -f docker-compose.yml ]; then
-  INGRESS_BIND="$(sed -n 's/^ *- "\([^":]*\):3101-.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
+  # The router is the only published non-SOCKS port, so match the line that is
+  # not a 1080 mapping instead of hard-coding the port number.
+  INGRESS_BIND="$(sed -n '/:1080"$/! s/^ *- "\([^":]*\):[0-9][0-9]*:[0-9][0-9]*"$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
   [ -n "$INGRESS_BIND" ] && export INGRESS_BIND
+fi
+if [ -z "${ROUTER_PORT:-}" ] && [ -f docker-compose.yml ]; then
+  ROUTER_PORT="$(sed -n '/:1080"$/! s/^ *- "\([^":]*\):\([0-9][0-9]*\):[0-9][0-9]*"$/\2/p' docker-compose.yml 2>/dev/null | head -n 1)"
+  [ -n "$ROUTER_PORT" ] && export ROUTER_PORT
 fi
 
 COUNT_FROM_DEPLOY=0

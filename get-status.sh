@@ -39,8 +39,12 @@ fi
 # generator's loopback binds when no compose file exists.
 SOCKS_BIND="$(sed -n 's/^ *- "\([^":]*\):[0-9][0-9]*:1080"$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
 [ -n "$SOCKS_BIND" ] || SOCKS_BIND="127.0.0.1"
-ROUTER_PUBLISHED="$(sed -n 's/^ *- "\([^":]*\):3100:.*$/\1/p' docker-compose.yml 2>/dev/null | head -n 1)"
-ROUTER_BIND="$ROUTER_PUBLISHED"
+# The host port is generated (ROUTER_PORT, default 3100), so parse it instead
+# of assuming it: the client URL must carry the port that actually listens.
+ROUTER_LINE="$(sed -n '/:1080"$/! s/^ *- "\([^":]*\):\([0-9][0-9]*\):[0-9][0-9]*"$/\1 \2/p' docker-compose.yml 2>/dev/null | head -n 1)"
+ROUTER_BIND="${ROUTER_LINE% *}"
+ROUTER_PORT="${ROUTER_LINE#* }"
+[ -n "$ROUTER_BIND" ] || ROUTER_PORT=""
 # Direct public-IP ingress marker: compose bakes RELAY_DIRECT_PUBLIC=1 and
 # the Basic credentials, so the client URL can be printed with embedded creds.
 DIRECT_PUBLIC="$(sed -n 's/^ *- RELAY_DIRECT_PUBLIC=1$/direct/p' docker-compose.yml 2>/dev/null | head -n 1)"
@@ -207,7 +211,7 @@ elif [ -z "$ROUTER_BIND" ]; then
 elif [ "$ROUTER_BIND" = "127.0.0.1" ]; then
   echo "=== Relay URL: router bound to 127.0.0.1 (not reachable from the tailnet) ==="
   echo "(re-run: INGRESS_BIND=${TS_IP} ./generate-compose.sh ${COUNT} && docker compose up -d)"
-  CLIENT_URL="http://127.0.0.1:3100"
+  CLIENT_URL="http://127.0.0.1:${ROUTER_PORT}"
 else
   if [ "$ROUTER_BIND" = "0.0.0.0" ]; then
     HOST_ADDR="$TS_IP"
@@ -220,7 +224,7 @@ else
   fi
   AUTH_PREFIX=""
   [ -n "$PROXY_AUTH_VALUE" ] && AUTH_PREFIX="${PROXY_AUTH_VALUE}@"
-  CLIENT_URL="http://${AUTH_PREFIX}${HOST_ADDR}:3100"
+  CLIENT_URL="http://${AUTH_PREFIX}${HOST_ADDR}:${ROUTER_PORT}"
   if [ -n "$DIRECT_PUBLIC" ]; then
     echo "=== Relay URL (public, proxy credentials enforced) ==="
   else
