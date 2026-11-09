@@ -171,10 +171,13 @@ budget in a few passes.
 `EGRESS_SETTLE_S` (150 s) and is not probed inside that window. Probing during
 the WARP handshake is what used to produce false 429s and back-to-back restarts.
 
-**Honouring `Retry-After`.** A live 429 signal that carries `retry-after: N`
-with `N <= 120` schedules the next probe at that deadline instead of restarting
-the container: upstream has already said when it will accept traffic again. A
-*probe* 429 no longer schedules anything — probes are liveness-only (below).
+**`Retry-After` is not a restart veto.** A live 429 signal restarts the lane
+whether or not it carries `retry-after`, and however short the value is: the
+header describes the egress being abandoned, and a restart mints a new one, so
+waiting it out would keep a throttled lane in a small pool for minutes and gain
+nothing. The relay separately holds that lane out of rotation for
+`LANE_COOLDOWN_429_MS`; the restart is what puts a clean lane back behind it. A
+*probe* 429 still schedules nothing — probes are liveness-only (below).
 
 **Restart spacing.** Restarts are serialised at least `ROTATE_SPACING_MS`
 (4000 ms) apart, so the host disk never sees two container stop/starts at once.

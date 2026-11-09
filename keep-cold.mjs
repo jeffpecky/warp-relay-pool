@@ -41,10 +41,11 @@
  * restarts (tier-1, tier-2, 502 and server_error) share one serialisation
  * chain that starts them at least ROTATE_SPACING_MS apart.
  *
- * A 429 carrying a numeric `retry-after` <= 120 s never restarts: it sets the
- * next probe time instead. That applies to a client's report, which carries the
- * header; a probe 429 no longer rotates anything (it is liveness evidence, and
- * the client owns the verdict). Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
+ * A 429 from the client's report always restarts (subject to the gate): the
+ * report names an egress whose throttle the client already saw, and restarting
+ * is what replaces it. The `retry-after` header is not consulted — it describes
+ * the address being abandoned, not the lane. A probe 429 no longer rotates
+ * anything (it is liveness evidence, and the client owns the verdict). Tier-2 (wipe /etc/wireguard/wg0.conf + restart,
  * one Cloudflare registration) is used only for 429 evidence, after two failed
  * post-restart verifications, and at most once per relay per TIER2_MIN_INTERVAL_S;
  * server_error and 502 rotations are tier-1 only. Nodes without wg0.conf abort
@@ -2368,26 +2369,12 @@ async function signalsPass() {
   // longer exists.
   if (!Number.isFinite(Number(sig.ts)) || Number(sig.ts) <= entry.lastRotate) continue;
   if (Number(sig.status) === 429) {
+   // `retry-after` is deliberately not consulted. It describes the egress
+   // being abandoned, and a WARP lane gets a fresh one from a restart — so a
+   // short header is not a reason to keep a throttled lane in the pool. The
+   // relay already holds the lane out of rotation for LANE_COOLDOWN_429_MS;
+   // this pass is what puts a clean lane back behind it.
    const model = typeof sig.model === "string" ? sig.model : "";
-   // Number(null) is 0, so a numeric check — not a coercion — decides whether
-   // the upstream actually asked us to wait.
-   const retryAfter = typeof sig.retryAfter === "number" ? sig.retryAfter : NaN;
-   // A short Retry-After is the upstream asking us to wait, not to change
-   // egress: schedule the next probe and leave the container alone.
-   if (Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= 120) {
-    const at = now();
-    dirty.add(index);
-    patchRelay(state, index, {
-     dirty: true,
-     lastProbe: at,
-     pendingVerify: false,
-     probeAfter: at + retryAfter * 1000,
-     consecutiveFailures: entry.consecutiveFailures + 1,
-     last429: { model, ts: at },
-    });
-    log(`#${index} retry-after ${retryAfter}s — scheduling, no restart`);
-    continue;
-   }
    classifySignal(index, model, ctx);
   } else {
    patchRelay(state, index, cleanPatch());

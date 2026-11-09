@@ -1318,7 +1318,12 @@ test("--signals restarts the named relay without probing anything", async () => 
   assert.deepEqual(JSON.parse(fs.readFileSync(sc.signalFile, "utf8")), { signals: [] });
 });
 
-test("--signals leaves a short retry-after alone", async () => {
+test("--signals restarts on a short retry-after instead of waiting it out", async () => {
+  // A short retry-after describes the egress being abandoned, not the lane:
+  // restarting mints a new one, so waiting the header out leaves a throttled
+  // lane in a small pool for two minutes for no benefit. This is the shape
+  // zen-proxy reports (upstream sends retry-after ~30), so it is the regression
+  // that matters most here.
   const sc = newScenario({ count: 4 });
   await startRelays(sc);
   seedCleanState(sc);
@@ -1327,8 +1332,7 @@ test("--signals leaves a short retry-after alone", async () => {
   }));
   const r = await runOnce(sc, {}, ["--signals"]);
   assert.equal(r.code, 1, r.stdout + r.stderr);
-  assert.deepEqual(restartLines(sc), []);
-  assert.match(r.stdout, /retry-after 60s/);
+  assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-2"]);
 });
 
 test("--signals restarts nothing when history says the model is quota-capped", async () => {
