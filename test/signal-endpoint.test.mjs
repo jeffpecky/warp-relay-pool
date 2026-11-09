@@ -66,7 +66,7 @@ function startSocks(index) {
   });
 }
 
-// One CONNECT through the relay as a `c-<id>` client. Returns the lane that
+// One CONNECT through the relay as a named client. Returns the lane that
 // served it, or null when the relay refused. Node emits 'connect' for a
 // non-200 CONNECT response too, so the status is what decides.
 function connectAs(clientId, pass = PASS) {
@@ -228,6 +228,26 @@ test("a client id binds one lane, and a 429 report moves it to another", async (
   assert.equal(records[0].retryAfter, 30);
 });
 
+test("any username is an identity: a plain user gets the same lane affinity and reporting", async () => {
+  // The token is the capability. `runner` — the wizard default — must hold a
+  // lane and be able to condemn it exactly like a `c-`-prefixed name.
+  const first = await connectAs("runner");
+  assert.ok(first >= 0, "a plain username with the right password must get a lane");
+  assert.equal(await connectAs("runner"), first, "it holds its lane across tunnels");
+
+  const res = await postSignal({ clientId: "runner", status: 429 });
+  assert.equal(res.status, 204, "its 429 report must be accepted");
+  const next = await connectAs("runner");
+  assert.notEqual(next, first, "a reported 429 must rotate it");
+});
+
+test("a lane pin is not an identity", async () => {
+  // `lane-N` is the keep-cold probe pin and is refused as a report identity;
+  // it is never a client name.
+  const res = await postSignal({ clientId: "lane-1", status: 429 });
+  assert.equal(res.status, 400);
+});
+
 test("a recovery report makes the condemned lane selectable again", async () => {
   const held = await connectAs("c-beta");
   assert.ok(held >= 0);
@@ -254,10 +274,11 @@ test("a bad token is rejected and condemns nothing", async () => {
 
 test("the endpoint rejects malformed reports", async () => {
   // A lane id must never be accepted: only the relay decides which lane a
-  // client is served by.
+  // client is served by. Any other username IS a valid identity now.
   for (const body of [
     { clientId: "c-x", status: 429, lane: 2 },
     { clientId: "lane-1", status: 429 },
+    { clientId: "c x", status: 429 },
     { clientId: "c-x", status: 500 },
     { status: 429 },
   ]) {

@@ -55,12 +55,13 @@ function secretEquals(given, expected) {
 // Parse the relay's own Basic gate once: the connect path and the request path
 // both need the decoded credentials, not just a yes/no.
 //
-// Three accepted shapes, all requiring the same password half:
-//   "user:pass"          the exact configured credential
+// The password half is the only gate. Given it, the username is just the
+// caller's identity, so any name is accepted:
+//   "<anything>:pass"    the caller names itself; its tunnels share one lane
 //   "lane-N:pass"        a keep-cold probe pinning the lane it measures
-//   "c-<id>:pass"        a client naming itself so its tunnels share one lane
-// The two non-exact shapes are not a weaker gate: the password half must still
-// match exactly, and a caller who has it could already send the exact shape.
+// The second is reserved: a probe pin is not an identity, so `lane-N` carries
+// no client id. Neither shape is a weaker gate — the password still matches
+// exactly, and a caller who has it could already send the configured user.
 function proxyAuthInfo(req) {
   if (!RELAY_PROXY_AUTH) return { ok: true, user: null, pass: null, clientId: null };
   const header = String(req.headers["proxy-authorization"] || "");
@@ -73,8 +74,8 @@ function proxyAuthInfo(req) {
   const wantPass = RELAY_PROXY_AUTH.includes(":")
     ? RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1)
     : "";
-  const laneForm = /^lane-\d+$/.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
-  const clientForm = CLIENT_ID_RE.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
+  const laneForm = LANE_PIN_RE.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
+  const clientForm = LANE_PIN_RE.test(user) === false && CLIENT_ID_RE.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
   if (!laneForm && !clientForm && !secretEquals(decoded, RELAY_PROXY_AUTH)) {
     return { ok: false, user: null, pass: null, clientId: null };
   }
@@ -106,10 +107,13 @@ const RELAY_SIGNAL_TOKEN = process.env.RELAY_SIGNAL_TOKEN || "";
 const SIGNAL_PATH = "/__signal";
 const SIGNAL_BODY_MAX = 8 * 1024;
 // A self-declared client id is a grouping key, not a capability: it can only
-// place the caller in a lane, and the password (or an open relay) is what
-// authorizes that. Restricted to a shape that cannot smuggle a separator into
-// the sticky key or a newline into a log line.
-const CLIENT_ID_RE = /^c-[A-Za-z0-9_-]{1,64}$/;
+// place the caller in a lane, and the password half is what authorizes that.
+// ANY username is an identity — `runner` and the wizard's default included.
+// The shape only rules out what could not have come from a proxy username
+// (`:` ends one, whitespace and control characters would split a log line) and
+// `lane-N`, which is the keep-cold probe pin and therefore never an identity.
+const LANE_PIN_RE = /^lane-\d+$/;
+const CLIENT_ID_RE = /^[^\s:\u0000-\u001f\u007f]{1,64}$/;
 
 const RETRY_MAX = laneEnv("RELAY_LANE_RETRY_MAX", 3, { allowZero: true });
 const RETRY_MAX_BODY = laneEnv("RELAY_LANE_RETRY_MAX_BODY", 1048576);
@@ -425,7 +429,7 @@ async function handleSignal(req, res) {
 
   const clientId = body?.clientId;
   const status = body?.status;
-  if (typeof clientId !== "string" || !CLIENT_ID_RE.test(clientId)) {
+  if (typeof clientId !== "string" || LANE_PIN_RE.test(clientId) || !CLIENT_ID_RE.test(clientId)) {
     res.writeHead(400, { "content-type": "application/json" });
     return res.end(JSON.stringify({ error: "Invalid clientId" }));
   }
@@ -930,12 +934,13 @@ server.on("error", (err) => {
 
 server.listen(BASE_PORT, "0.0.0.0", () => {
   console.log(`listening on 0.0.0.0:${BASE_PORT} -> ${COUNT} lane(s)`);
-  // A `c-<id>` client needs a non-empty password half to authenticate at all,
-  // and the failure looks like a client bug rather than a config one.
+  // Any username authenticates only through its password half, so an empty
+  // password makes every named client fail at the gate — and the failure looks
+  // like a client bug rather than a config one.
   if (RELAY_SIGNAL_TOKEN && RELAY_PROXY_AUTH.includes(":")) {
     const wantPass = RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1);
     if (wantPass === "") {
-      console.error("[relay] RELAY_PROXY_AUTH has an empty password half: `c-<id>` clients cannot authenticate.");
+      console.error("[relay] RELAY_PROXY_AUTH has an empty password half: named clients cannot authenticate.");
     }
   }
   // Without this nothing probes: sick lanes would never be parked or

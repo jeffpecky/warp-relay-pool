@@ -77,10 +77,12 @@ land on the same lane, with no TTL. Without a session header the key falls back
 to the peer address.
 
 A `CONNECT` tunnel carries none of those headers, so an authenticating client
-may name itself in the proxy userinfo instead (`c-<id>:<pass>`). The stickiness
-key becomes `c:<id>`, which is the only way the pool can spread one host's
-tunnels across lanes instead of collapsing them onto its peer address forever.
-The password half is still the trust boundary.
+may name itself in the proxy userinfo instead (`<any-user>:<pass>`). The
+stickiness key becomes `c:<user>`, which is the only way the pool can spread one
+host's tunnels across lanes instead of collapsing them onto its peer address
+forever. The password half is the whole trust boundary: given it, any username
+is a valid identity — `runner` and the wizard default included. The one reserved
+name is `lane-N`, which is the keep-cold probe's pin, not a client.
 
 A lane that 429s or fails is cooled and the client fails over; the sticky pin
 moves with it. When every lane is exhausted by 429s, the request is served
@@ -96,19 +98,18 @@ TLS (zen-proxy) therefore reports the verdict out of band:
 ```
 POST /__signal                     (same host and port as the proxy)
 authorization: Bearer <RELAY_SIGNAL_TOKEN>
-{ "clientId": "c-<id>", "status": 429, "model": "…", "retryAfter": 30 }
+{ "clientId": "<user>", "status": 429, "model": "…", "retryAfter": 30 }
 ```
 
 - The report names the **client**, never a lane. The relay looks up the lane
   that client id is bound to and cools it; a client cannot choose an egress.
-- `clientId` is the proxy-auth **username** in its `c-<id>` form. All three
-  accepted userinfo shapes (`user`, `lane-N`, `c-<id>`) need the same password
-  half — the username is a routing label, not a second credential. A client
-  presenting the plain configured user (`runner`, the wizard default) is
-  served normally but has no identity, so its 429s cannot be reported. This is
-  why 429 reporting is enabled by `RELAY_SIGNAL_TOKEN`, not by the username:
-  point `PROXY_URL` at any other rotating proxy with no token and it is a
-  plain proxy, with no control surface here.
+- `clientId` is the proxy-auth **username**, whatever it is. The username is a
+  routing label, not a second credential — the password half is what the relay
+  validates. `lane-N` is refused here because it is the prober's lane pin and
+  carries no identity. This is why 429 reporting is enabled by
+  `RELAY_SIGNAL_TOKEN`, not by the username: point `PROXY_URL` at any other
+  rotating proxy with no token and it is a plain proxy, with no control surface
+  here.
 - Unset `RELAY_SIGNAL_TOKEN` ⇒ the endpoint answers `404`, so an install that
   does not use signalling exposes no new surface. Wrong token ⇒ `401`.
 - The cooling is immediate (the next tunnel from that client rotates), and the

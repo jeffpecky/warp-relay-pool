@@ -202,10 +202,12 @@ the marker upstream, and a stale record can never re-rotate a relay that was
 already restarted after it (records older than the relay's `lastRotate` are
 ignored).
 
-The shipped client is zen-proxy (`zen-proxy/src/relay.mjs`); it must carry its
-own `c-<id>` as the proxy userinfo, because that is the identity the relay
-resolved the lane for. Anything else that dials the relay over CONNECT is
-invisible to this path and gets the periodic sweep's liveness-only treatment.
+The shipped client is zen-proxy (`zen-proxy/src/relay.mjs`); it carries its own
+proxy username as the identity, because that is what the relay resolved the
+lane for. Any username works (`runner` and the wizard default included); the
+password half is the credential. Anything else that dials the relay over
+CONNECT is invisible to this path and gets the periodic sweep's liveness-only
+treatment.
 
 `LIVE_SIGNALS=1` is no longer required for the file to be consumed:
 `RELAY_SIGNAL_TOKEN` implies the signal writer, since a report that only cools
@@ -226,9 +228,9 @@ chmod 600 .env
 ```
 
 Then set the same value as `RELAY_SIGNAL_TOKEN` in zen-proxy. The client id is
-the client's own choice, not a secret and not relay-generated: zen-proxy reads
-it from `PROXY_URL`'s userinfo (`c-<id>`) — there is no separate setting — so
-the token plus a `c-<id>` proxy URL is the whole client-side configuration.
+whatever username the client dials with, not a secret and not relay-generated:
+zen-proxy reads it from `PROXY_URL`'s userinfo — there is no separate setting —
+so the token plus a proxy URL is the whole client-side configuration.
 
 This path is optional: when the file is absent or corrupt the probe scheduler
 above runs unchanged, so a pool that never enables signals still converges. The

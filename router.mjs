@@ -48,9 +48,8 @@ export function resolvePinnedLane({ headers = {}, proxyUser, proxyPass, lanes, p
 // L7 path already keys on, so nothing changes there. `clientId` is next: a
 // CONNECT tunnel carries no relay headers at all, so without it every tunnel
 // from one host collapses onto the peer address and holds a single lane for
-// the process lifetime — the pool never spreads. The id arrives in the proxy
-// userinfo (`c-<id>:<pass>`), which is the only field an authenticating CONNECT
-// client can vary.
+// the process lifetime — the pool never spreads. Any proxy-auth username is
+// that id (`<user>:<pass>`), which is the only field a CONNECT client can vary.
 export function laneKey(headers = {}, peerAddress = "", clientId = "") {
   const h = headers || {};
   for (const name of ["x-opencode-session", "x-session-affinity", "x-session-id"]) {

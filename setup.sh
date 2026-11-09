@@ -528,7 +528,7 @@ fi
 # throttled egress.
 #
 # Only meaningful where proxy auth is configured: the client names itself as
-# the userinfo `c-<id>:<pass>`, and without a password half it cannot
+# the userinfo `<user>:<pass>`, and without a password half it cannot
 # authenticate at all. Tunnels mode publishes an unauthenticated URL, so the
 # signal path stays inert there and no token is generated.
 if [ -z "${RELAY_SIGNAL_TOKEN:-}" ] && [ -n "${RELAY_PROXY_AUTH:-}" ]; then
@@ -835,15 +835,15 @@ echo ""
 if [ -n "${RELAY_SIGNAL_TOKEN:-}" ]; then
   echo "Client 429 reporting (zen-proxy) — copy these two values into it:"
   echo "  RELAY_SIGNAL_TOKEN=${RELAY_SIGNAL_TOKEN}"
-  echo "  PROXY_URL=http://c-<pick-any-id>:<proxy-password>@<relay-host>:<port>"
+  echo "  PROXY_URL=http://<any-user>:<proxy-password>@<relay-host>:<port>"
   echo ""
-  echo "  The username half MUST start with c- — it names this client, and that is"
-  echo "  how a report maps back to the lane it was served. Pick any suffix"
-  echo "  (letters, digits, _ or -); zen-proxy reads it from PROXY_URL, so there is"
-  echo "  no separate client-id setting. Do NOT reuse '${RELAY_PROXY_AUTH%%:*}': it"
-  echo "  authenticates fine but carries no identity, so 429s are never reported."
-  echo "  The password half is the proxy password from RELAY_PROXY_AUTH. The token"
-  echo "  is in ./.env (root-only) — treat it like the proxy password."
+  echo "  Any username works, including the default '${RELAY_PROXY_AUTH%%:*}': it"
+  echo "  names this client, and that is how a report maps back to the lane it was"
+  echo "  served. The password half is the proxy password from RELAY_PROXY_AUTH."
+  echo "  zen-proxy reads the username from PROXY_URL, so there is no separate"
+  echo "  client-id setting. The only reserved username is lane-<n>, which the"
+  echo "  keep-cold prober uses to pin a lane — it is not a client identity."
+  echo "  The token is in ./.env (root-only) — treat it like the proxy password."
   echo ""
 else
   echo "Client 429 reporting is OFF: no RELAY_SIGNAL_TOKEN was minted (it needs"
