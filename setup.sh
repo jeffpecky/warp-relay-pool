@@ -72,6 +72,25 @@ for arg in "$@"; do
   esac
 done
 
+# A random hex secret. Used for the direct-ingress proxy password and for the
+# client 429 report token below.
+gen_pass() {
+  openssl rand -hex 12 2>/dev/null \
+    || head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' \
+    || date +%s%N | sha256sum 2>/dev/null | cut -c1-24
+}
+
+# Persist KEY=VALUE into .env, replacing an existing assignment in place.
+# `generate-compose.sh` bakes these into the compose file, so a value written
+# here only takes effect on the next generation — callers regenerate.
+set_env_value() {
+  if [ -f .env ] && grep -q "^${1}=" .env; then
+    sed -i.bak "s|^${1}=.*|${1}=${2}|" .env && rm -f .env.bak
+  else
+    printf '\n%s=%s\n' "$1" "$2" >> .env
+  fi
+}
+
 echo ""
 echo "================================================================="
 echo "   warp-relay-pool — Automated VPS Deployment Wizard"
@@ -451,11 +470,6 @@ else
     export INGRESS_BIND
     RELAY_DIRECT_PUBLIC=1
     export RELAY_DIRECT_PUBLIC
-    gen_pass() {
-      openssl rand -hex 12 2>/dev/null \
-        || head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' \
-        || date +%s%N | sha256sum 2>/dev/null | cut -c1-24
-    }
     if [ -z "${RELAY_PROXY_AUTH:-}" ]; then
       if [ "$AUTO_YES" = true ]; then
         RELAY_PROXY_AUTH="runner:$(gen_pass)"
@@ -502,6 +516,28 @@ else
     log_warn "Authenticate Tailscale, then re-run: INGRESS_BIND=<tailscale-ip> sh ./generate-compose.sh ${COUNT}"
   fi
 fi
+
+# -------------------------------------------------------------
+# 3b. Client 429-report token
+# -------------------------------------------------------------
+# The relay cannot read a status inside a CONNECT tunnel, so the client that
+# terminates TLS (zen-proxy) reports the 429 over POST /__signal. That path is
+# gated on RELAY_SIGNAL_TOKEN; unset means the endpoint answers 404 and every
+# reported throttle is dropped in silence. Mint one here so a fresh install
+# has working 429 rotation instead of a pool that never learns about a
+# throttled egress.
+#
+# Only meaningful where proxy auth is configured: the client names itself as
+# the userinfo `c-<id>:<pass>`, and without a password half it cannot
+# authenticate at all. Tunnels mode publishes an unauthenticated URL, so the
+# signal path stays inert there and no token is generated.
+if [ -z "${RELAY_SIGNAL_TOKEN:-}" ] && [ -n "${RELAY_PROXY_AUTH:-}" ]; then
+  RELAY_SIGNAL_TOKEN="$(gen_pass)"
+  export RELAY_SIGNAL_TOKEN
+  set_env_value RELAY_SIGNAL_TOKEN "$RELAY_SIGNAL_TOKEN"
+fi
+# .env now carries two secrets; it is created by the block above at umask 022.
+chmod 600 .env 2>/dev/null || true
 
 # -------------------------------------------------------------
 # 4. Build Minimal MicroWARP & Relay Images
@@ -794,5 +830,25 @@ echo "   ${SWEEP_INTERVAL_MIN} minutes, and warp-keep-cold-signals.service watch
 echo "   429 signals as they land, so a freshly throttled egress is rotated"
 echo "   long before the next sweep. A rotated relay gets a new egress and"
 echo "   rejoins the pool automatically."
+echo "======================================================================="
+echo ""
+if [ -n "${RELAY_SIGNAL_TOKEN:-}" ]; then
+  echo "Client 429 reporting (zen-proxy) — copy these two values into it:"
+  echo "  RELAY_SIGNAL_TOKEN=${RELAY_SIGNAL_TOKEN}"
+  echo "  PROXY_URL=http://c-<pick-any-id>:<proxy-password>@<relay-host>:<port>"
+  echo ""
+  echo "  The c-<id> is yours to choose (letters, digits, _ or -); zen-proxy reads"
+  echo "  it from PROXY_URL, so there is no separate client-id setting. The"
+  echo "  password half is the proxy password from RELAY_PROXY_AUTH. The token is"
+  echo "  in ./.env (root-only) — treat it like the proxy password."
+  echo ""
+else
+  echo "Client 429 reporting is OFF: no RELAY_SIGNAL_TOKEN was minted (it needs"
+  echo "   proxy auth, so tunnels mode has none). 429s will rotate on the sweep"
+  echo "   timer only. To turn it on: add RELAY_SIGNAL_TOKEN=$(gen_pass) to .env,"
+  echo "   re-run ./generate-compose.sh ${COUNT} && docker compose up -d, then set"
+  echo "   the same token as RELAY_SIGNAL_TOKEN in zen-proxy."
+  echo ""
+fi
 echo "======================================================================="
 echo ""

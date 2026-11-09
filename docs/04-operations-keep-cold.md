@@ -210,7 +210,25 @@ invisible to this path and gets the periodic sweep's liveness-only treatment.
 `LIVE_SIGNALS=1` is no longer required for the file to be consumed:
 `RELAY_SIGNAL_TOKEN` implies the signal writer, since a report that only cools
 a lane in memory would leave the container throttled. With no token the
-endpoint answers 404 and the install exposes no new surface.
+endpoint answers 404 and the install exposes no new surface — and that is the
+failure mode to watch for, because it is silent on the client side.
+
+`setup.sh` mints the token on every install that has proxy auth (the direct
+public-IP ingress), prints it once in the closing summary, and persists it to
+`.env` at mode 600. A tunnels install has no proxy auth, so no token is
+generated and this path stays inert. To add one to an existing install:
+
+```sh
+# host, in the relay checkout
+printf '\nRELAY_SIGNAL_TOKEN=%s\n' "$(openssl rand -hex 12)" >> .env
+chmod 600 .env
+./generate-compose.sh <COUNT> && docker compose up -d   # bakes it into the relay env
+```
+
+Then set the same value as `RELAY_SIGNAL_TOKEN` in zen-proxy. The client id is
+the client's own choice, not a secret and not relay-generated: zen-proxy reads
+it from `PROXY_URL`'s userinfo (`c-<id>`) when `ZEN_PROXY_CLIENT_ID` is unset,
+so the token plus a `c-<id>` proxy URL is the whole client-side configuration.
 
 This path is optional: when the file is absent or corrupt the probe scheduler
 above runs unchanged, so a pool that never enables signals still converges. The
