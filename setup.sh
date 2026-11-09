@@ -506,6 +506,30 @@ fi
 # -------------------------------------------------------------
 # 4. Build Minimal MicroWARP & Relay Images
 # -------------------------------------------------------------
+# Preflight: the host uplink must carry the lane's encapsulated packet
+# (WG_MTU inner + ~80 outer). A lane is dual-stack, so its MTU cannot go below
+# 1280 (RFC 8200) — meaning the host uplink has to be at least ~1360. WSL2's
+# vNIC defaults to 1280, and the failure is silent: the lane reports healthy
+# in-container while every client HTTPS request stalls in the TLS handshake
+# (plain HTTP still works). Catch it here instead of after an hour of debugging.
+check_uplink_mtu() {
+  up_dev="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+  [ -n "$up_dev" ] || return 0
+  up_mtu="$(cat "/sys/class/net/${up_dev}/mtu" 2>/dev/null || echo "")"
+  case "$up_mtu" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$up_mtu" -lt 1360 ]; then
+    log_warn "Host uplink ${up_dev} has MTU ${up_mtu}; a WARP lane needs about 1360."
+    log_warn "Clients will stall mid-TLS-handshake through the pool (HTTP may still work)."
+    log_warn "This is a host/WSL2 limit, not a pool misconfiguration. If this is WSL2:"
+    log_warn "  sudo ip link set dev ${up_dev} mtu 1500   # re-run after each WSL restart"
+    log_warn "Do NOT lower WARP_MTU instead: lanes are dual-stack and 1280 is the floor."
+    log_warn "A normal VPS uplink is already 1500 and needs nothing here."
+  else
+    log_ok "Host uplink ${up_dev} MTU ${up_mtu} can carry a full-size WARP lane."
+  fi
+}
+check_uplink_mtu
+
 # The generated compose intentionally drops SYS_MODULE. Ensure the host loads
 # the WireGuard module at boot so a reboot does not leave wg-quick unable to
 # create its interface.
