@@ -213,10 +213,10 @@ ignored).
 
 The shipped client is zen-proxy (`zen-proxy/src/relay.mjs`); it carries its own
 proxy username as the identity, because that is what the relay resolved the
-lane for. Any username works (`runner` and the wizard default included); the
-password half is the credential. Anything else that dials the relay over
-CONNECT is invisible to this path and gets the periodic sweep's liveness-only
-treatment.
+lane for. That username is a credential: both halves must match an account in
+`RELAY_PROXY_AUTH`, so an invented name is a `407` rather than a new identity.
+Anything else that dials the relay over CONNECT is invisible to this path and
+gets the periodic sweep's liveness-only treatment.
 
 `LIVE_SIGNALS=1` is no longer required for the file to be consumed:
 `RELAY_SIGNAL_TOKEN` implies the signal writer, since a report that only cools

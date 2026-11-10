@@ -316,6 +316,14 @@ const BASE_PORT = envInt("BASE_PORT", 3000, { max: 65535 });
 // or `--env-file=.env` for manual runs; standalone mesh/tunnels installs
 // simply leave it unset.
 const RELAY_PROXY_AUTH = process.env.RELAY_PROXY_AUTH ?? "";
+// The password a `lane-N` probe pin authenticates with: the first configured
+// account's. Mirrors server.mjs's PROBE_PASS — the pin has no username of its
+// own, so it borrows the account's password half.
+const PROBE_PASS = RELAY_PROXY_AUTH.split(",")
+  .map((e) => e.trim())
+  .filter(Boolean)
+  .map((e) => (e.indexOf(":") > 0 ? e.slice(e.indexOf(":") + 1) : ""))
+  .find((p) => p !== "") ?? "";
 const COUNT = envInt("COUNT", 10, { min: 1, max: 64 });
 const PROBE_TARGET = envUrl("PROBE_TARGET", "https://opencode.ai");
 const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/inference/v1/chat/completions");
@@ -1037,8 +1045,7 @@ async function wreqSession(index, wreq) {
   // credentials (the probe then rides the unauthenticated lane shape). The
   // user carries the lane: `lane-N`, and the configured password when auth is
   // on — that pair is what the relay accepts as a pin.
-  const pass = RELAY_PROXY_AUTH.includes(":") ? RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1) : "";
-  const user = `lane-${index}${pass ? `:${pass}` : ""}`;
+  const user = `lane-${index}${PROBE_PASS ? `:${PROBE_PASS}` : ""}`;
   // PROBE_DIRECT=1 drops the lane proxy so the same request rides this host's
   // own egress. Diagnostic only: distinguishes "every WARP egress is throttled"
   // from "the probe shape is still wrong".
@@ -1106,8 +1113,8 @@ async function probe(index, model) {
       method: "POST",
       headers: {
         ...probeHeaders(relayPath, sid, index),
-        ...(RELAY_PROXY_AUTH
-          ? { "proxy-authorization": `Basic ${Buffer.from(RELAY_PROXY_AUTH).toString("base64")}` }
+        ...(PROBE_PASS
+          ? { "proxy-authorization": `Basic ${Buffer.from(`lane-${index}:${PROBE_PASS}`).toString("base64")}` }
           : {}),
       },
       body,

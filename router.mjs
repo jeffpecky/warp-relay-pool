@@ -34,12 +34,16 @@ export function resolvePinnedLane({ headers = {}, proxyUser, proxyPass, lanes, p
   if (fromHeader) return fromHeader;
 
   // Userinfo form: proxy-auth user "lane-N" plus the password half of the
-  // configured credential. No configured credential means no pin.
+  // FIRST configured account. RELAY_PROXY_AUTH is a comma-separated account
+  // list, and the probe pin borrows the first account's password, so the
+  // first entry is the only one that can authenticate a pin. No configured
+  // credential means no pin.
   const m = /^lane-(\d+)$/.exec(String(proxyUser ?? ""));
   if (!m) return null;
   if (typeof proxyAuth !== "string" || proxyAuth === "") return null;
-  const colon = proxyAuth.indexOf(":");
-  const wantPass = colon < 0 ? "" : proxyAuth.slice(colon + 1);
+  const first = proxyAuth.split(",")[0].trim();
+  const colon = first.indexOf(":");
+  const wantPass = colon < 0 ? "" : first.slice(colon + 1);
   if (wantPass === "" || proxyPass !== wantPass) return null;
   return byIndex(m[1]);
 }
@@ -159,6 +163,7 @@ export function createLanes({
   cooldownMs = 240_000,
   cooldown429Ms = 120_000,
   stickyMax = 10_000,
+  mode = "sticky",
   log = (msg) => console.log(`[router] ${msg}`),
 } = {}) {
   if (!Number.isInteger(count) || count < 1) throw new Error("createLanes: count required");
@@ -167,6 +172,13 @@ export function createLanes({
     // A non-positive cap would hang the eviction loop or silently disable
     // affinity; reject the typo at construction instead.
     throw new Error("createLanes: stickyMax must be a positive integer");
+  }
+  // Two documented rotation modes. `sticky` is the default because reasoning
+  // models return encrypted reasoning only the issuing egress can decrypt;
+  // `round-robin` spreads every request for maximum spread and is for callers
+  // that do not need that affinity.
+  if (mode !== "sticky" && mode !== "round-robin") {
+    throw new Error(`createLanes: mode must be sticky|round-robin (got ${JSON.stringify(mode)})`);
   }
 
   const lanes = Array.from({ length: count }, (_, i) => {
@@ -211,10 +223,15 @@ export function createLanes({
   }
 
   function pick(key) {
-    const held = key ? sticky.get(key) : undefined;
-    if (held && usable(held)) {
-      bindSticky(key, held);
-      return held;
+    // round-robin ignores the affinity pin on the way in but still records it:
+    // a 429 report resolves through heldFor(), so the lane the client was last
+    // served by must stay observable even when nothing sticks.
+    if (mode === "sticky") {
+      const held = key ? sticky.get(key) : undefined;
+      if (held && usable(held)) {
+        bindSticky(key, held);
+        return held;
+      }
     }
     for (let i = 0; i < count; i++) {
       rr = (rr % count) + 1;

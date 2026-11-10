@@ -52,16 +52,48 @@ function secretEquals(given, expected) {
   return timingSafeEqual(a, b);
 }
 
+// The account list: one `user:pass` pair per comma-separated entry. A password
+// may itself contain a colon, so only the FIRST colon separates the halves.
+// An entry with no colon, or an empty username, is a config error the caller
+// drops rather than a credential that can never match.
+const PROXY_ACCOUNTS = RELAY_PROXY_AUTH.split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean)
+  .map((entry) => {
+    const i = entry.indexOf(":");
+    return i > 0 ? { user: entry.slice(0, i), pass: entry.slice(i + 1) } : null;
+  })
+  .filter(Boolean);
+
+// The password a keep-cold `lane-N` pin authenticates with: the first account's,
+// since the probe has no username of its own. Empty when there is no account.
+const PROBE_PASS = PROXY_ACCOUNTS.length > 0 ? PROXY_ACCOUNTS[0].pass : "";
+
+function credentialMatches(user, pass) {
+  if (typeof user !== "string" || user === "" || typeof pass !== "string") return false;
+  // Check every account so the time taken does not reveal which one matched.
+  let matched = false;
+  for (const account of PROXY_ACCOUNTS) {
+    if (secretEquals(user, account.user) & secretEquals(pass, account.pass)) matched = true;
+  }
+  return matched;
+}
+
 // Parse the relay's own Basic gate once: the connect path and the request path
 // both need the decoded credentials, not just a yes/no.
 //
-// The password half is the only gate. Given it, the username is just the
-// caller's identity, so any name is accepted:
-//   "<anything>:pass"    the caller names itself; its tunnels share one lane
-//   "lane-N:pass"        a keep-cold probe pinning the lane it measures
-// The second is reserved: a probe pin is not an identity, so `lane-N` carries
-// no client id. Neither shape is a weaker gate — the password still matches
-// exactly, and a caller who has it could already send the configured user.
+// Both halves are credentials. `RELAY_PROXY_AUTH` is one or more `user:pass`
+// pairs, comma-separated, and a caller must match one of them exactly:
+//   "user:pass"          a configured account; the username is also the client
+//                        identity a 429 report maps back through
+//   "lane-N:<pass>"      a keep-cold probe pinning the lane it measures
+// The second is reserved and is NOT an account: it only authenticates with the
+// first pair's password, and it never carries a client id.
+//
+// A password-only gate would let anyone holding the password mint unlimited
+// identities, and each new username claims another sticky lane — one caller
+// could squat the whole pool. Requiring the username makes a name a credential,
+// so an invented one is a 407 like any other bad credential.
 function proxyAuthInfo(req) {
   if (!RELAY_PROXY_AUTH) return { ok: true, user: null, pass: null, clientId: null };
   const header = String(req.headers["proxy-authorization"] || "");
@@ -71,12 +103,9 @@ function proxyAuthInfo(req) {
   const colon = decoded.indexOf(":");
   const user = colon < 0 ? decoded : decoded.slice(0, colon);
   const pass = colon < 0 ? "" : decoded.slice(colon + 1);
-  const wantPass = RELAY_PROXY_AUTH.includes(":")
-    ? RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1)
-    : "";
-  const laneForm = LANE_PIN_RE.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
-  const clientForm = LANE_PIN_RE.test(user) === false && CLIENT_ID_RE.test(user) && wantPass !== "" && secretEquals(pass, wantPass);
-  if (!laneForm && !clientForm && !secretEquals(decoded, RELAY_PROXY_AUTH)) {
+  const laneForm = LANE_PIN_RE.test(user) && PROBE_PASS !== "" && secretEquals(pass, PROBE_PASS);
+  const clientForm = !LANE_PIN_RE.test(user) && CLIENT_ID_RE.test(user) && credentialMatches(user, pass);
+  if (!laneForm && !clientForm) {
     return { ok: false, user: null, pass: null, clientId: null };
   }
   return { ok: true, user, pass, clientId: clientForm ? user : null };
@@ -106,18 +135,21 @@ function laneEnv(name, fallback, { allowZero = false, passthrough = false } = {}
 const RELAY_SIGNAL_TOKEN = process.env.RELAY_SIGNAL_TOKEN || "";
 const SIGNAL_PATH = "/__signal";
 const SIGNAL_BODY_MAX = 8 * 1024;
-// A self-declared client id is a grouping key, not a capability: it can only
-// place the caller in a lane, and the password half is what authorizes that.
-// ANY username is an identity — `runner` and the wizard's default included.
-// The shape only rules out what could not have come from a proxy username
-// (`:` ends one, whitespace and control characters would split a log line) and
-// `lane-N`, which is the keep-cold probe pin and therefore never an identity.
+// A client id is the username half of a configured account: it only ever
+// arrives with that account's password, so the shape validates what the
+// credential gate already accepted — it is never a capability of its own.
+// The shape rules out what could not have come from a proxy username (`:` ends
+// one, whitespace and control characters would split a log line) and `lane-N`,
+// which is the keep-cold probe pin and therefore never an identity.
 const LANE_PIN_RE = /^lane-\d+$/;
 const CLIENT_ID_RE = /^[^\s:\u0000-\u001f\u007f]{1,64}$/;
 
 const RETRY_MAX = laneEnv("RELAY_LANE_RETRY_MAX", 3, { allowZero: true });
 const RETRY_MAX_BODY = laneEnv("RELAY_LANE_RETRY_MAX_BODY", 1048576);
 const STICKY_MAX = laneEnv("RELAY_LANE_STICKY_MAX", 10000, { passthrough: true });
+// Rotation mode, chosen at setup time. `sticky` keeps one account on one lane
+// (reasoning-issuer affinity); `round-robin` spreads every request.
+const LANE_MODE = (process.env.RELAY_LANE_MODE || "sticky").trim().toLowerCase();
 const LANE_PROBE_MS = laneEnv("RELAY_LANE_PROBE_S", 30, { allowZero: true }) * 1000;
 const LANE_COOLDOWN_MS = laneEnv("RELAY_LANE_COOLDOWN_S", 240) * 1000;
 const LANE_COOLDOWN_429_MS = laneEnv("RELAY_LANE_429_S", 120) * 1000;
@@ -384,6 +416,7 @@ const lanes = createLanes({
   cooldownMs: LANE_COOLDOWN_MS,
   cooldown429Ms: LANE_COOLDOWN_429_MS,
   stickyMax: STICKY_MAX,
+  mode: LANE_MODE,
   log: (msg) => console.log(`[router] ${msg}`),
 });
 
@@ -934,14 +967,14 @@ server.on("error", (err) => {
 
 server.listen(BASE_PORT, "0.0.0.0", () => {
   console.log(`listening on 0.0.0.0:${BASE_PORT} -> ${COUNT} lane(s)`);
-  // Any username authenticates only through its password half, so an empty
-  // password makes every named client fail at the gate — and the failure looks
-  // like a client bug rather than a config one.
-  if (RELAY_SIGNAL_TOKEN && RELAY_PROXY_AUTH.includes(":")) {
-    const wantPass = RELAY_PROXY_AUTH.slice(RELAY_PROXY_AUTH.indexOf(":") + 1);
-    if (wantPass === "") {
-      console.error("[relay] RELAY_PROXY_AUTH has an empty password half: named clients cannot authenticate.");
-    }
+  // A configured-but-unusable account list is a config error, not a client
+  // bug: every request would 407 and the cause would be invisible.
+  if (RELAY_PROXY_AUTH && PROXY_ACCOUNTS.length === 0) {
+    console.error("[relay] RELAY_PROXY_AUTH has no usable user:pass entry — every request will 407.");
+  } else if (PROXY_ACCOUNTS.some((a) => a.pass === "")) {
+    console.error("[relay] RELAY_PROXY_AUTH has an empty password for an account — that account cannot authenticate.");
+  } else if (PROXY_ACCOUNTS.length > 1) {
+    console.log(`[relay] ${PROXY_ACCOUNTS.length} proxy accounts configured.`);
   }
   // Without this nothing probes: sick lanes would never be parked or
   // re-admitted, and RELAY_LANE_PROBE_S would be a no-op knob.

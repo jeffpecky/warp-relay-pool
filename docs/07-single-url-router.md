@@ -77,12 +77,32 @@ land on the same lane, with no TTL. Without a session header the key falls back
 to the peer address.
 
 A `CONNECT` tunnel carries none of those headers, so an authenticating client
-may name itself in the proxy userinfo instead (`<any-user>:<pass>`). The
-stickiness key becomes `c:<user>`, which is the only way the pool can spread one
-host's tunnels across lanes instead of collapsing them onto its peer address
-forever. The password half is the whole trust boundary: given it, any username
-is a valid identity — `runner` and the wizard default included. The one reserved
-name is `lane-N`, which is the keep-cold probe's pin, not a client.
+names itself in the proxy userinfo instead (`<user>:<pass>`). The stickiness key
+becomes `c:<user>`, which is the only way the pool can spread one host's tunnels
+across lanes instead of collapsing them onto its peer address forever.
+
+**Both halves are credentials.** `RELAY_PROXY_AUTH` is one or more `user:pass`
+pairs, comma-separated; a caller must match one exactly, and only the first
+colon separates the halves. A right password with an invented username is a
+`407`, exactly like a wrong password — otherwise one caller holding the password
+could mint unlimited identities and squat every lane. To add a client, append
+`,user:pass` and regenerate the compose. The one reserved name is `lane-N`,
+which the keep-cold probe pins a lane with; it authenticates with the first
+account's password and is never a client identity.
+
+## Rotation mode
+
+`RELAY_LANE_MODE` selects how a request picks a lane:
+
+- `sticky` (default) — a client keeps one egress, as above. Reasoning models
+  need this: they return encrypted reasoning only the issuing egress can
+  decrypt.
+- `round-robin` — every request advances to the next usable lane. The binding is
+  still recorded, so a reported 429 still condemns the lane the client was last
+  served by.
+
+`setup.sh` asks once and persists the answer to `.env`; `generate-compose.sh`
+bakes it into the relay's environment, so regenerate after changing it.
 
 A lane that 429s or fails is cooled and the client fails over; the sticky pin
 moves with it. When every lane is exhausted by 429s, the request is served
@@ -103,13 +123,12 @@ authorization: Bearer <RELAY_SIGNAL_TOKEN>
 
 - The report names the **client**, never a lane. The relay looks up the lane
   that client id is bound to and cools it; a client cannot choose an egress.
-- `clientId` is the proxy-auth **username**, whatever it is. The username is a
-  routing label, not a second credential — the password half is what the relay
-  validates. `lane-N` is refused here because it is the prober's lane pin and
-  carries no identity. This is why 429 reporting is enabled by
-  `RELAY_SIGNAL_TOKEN`, not by the username: point `PROXY_URL` at any other
-  rotating proxy with no token and it is a plain proxy, with no control surface
-  here.
+- `clientId` is the proxy-auth **username** of a configured account. Both halves
+  are credentials, so a report can only name an account that already
+  authenticated. `lane-N` is refused here because it is the prober's lane pin
+  and carries no identity. 429 reporting is enabled by `RELAY_SIGNAL_TOKEN`, not
+  by the username: point `PROXY_URL` at any other rotating proxy with no token
+  and it is a plain proxy, with no control surface here.
 - Unset `RELAY_SIGNAL_TOKEN` ⇒ the endpoint answers `404`, so an install that
   does not use signalling exposes no new surface. Wrong token ⇒ `401`.
 - The cooling is immediate (the next tunnel from that client rotates), and the

@@ -99,6 +99,17 @@ if [ "$RELAY_DIRECT_PUBLIC" = "1" ] && [ -z "$RELAY_PROXY_AUTH" ]; then
   echo "       A public router without credentials is an open proxy." >&2
   exit 1
 fi
+# Rotation mode. `sticky` holds one account on one lane; `round-robin` spreads
+# every request. Anything else is a typo that would otherwise be silently
+# coerced at runtime.
+LANE_MODE="${RELAY_LANE_MODE:-sticky}"
+case "$LANE_MODE" in
+  sticky|round-robin) ;;
+  *)
+    echo "error: RELAY_LANE_MODE must be sticky|round-robin, got '$LANE_MODE'" >&2
+    exit 1
+    ;;
+esac
 
 # Inner WireGuard MTU. 1280 is Cloudflare's safe default and the IPv6 minimum
 # (RFC 8200) — every lane is dual-stack by default, and an IPv6 interface
@@ -165,8 +176,8 @@ cat <<HEADER
 # warp-N raw SOCKS5 proxy on ${SOCKS_BIND}:<10800+N> (override bind: WARP_BIND),
 # ${ROUTER_LINE}.
 # Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS,
-# RELAY_AUTH_TOKEN, LIVE_SIGNALS, LIVE_SIGNAL_FILE) is baked from the
-# generation-time environment / .env —
+# RELAY_AUTH_TOKEN, RELAY_LANE_MODE, LIVE_SIGNALS, LIVE_SIGNAL_FILE) is baked
+# from the generation-time environment / .env —
 # regenerate after editing either.
 # The relay app bind-mounts ./.keep-cold at /signals so its 429 signal file
 # lands in the same directory the host keep-cold reads (LIVE_SIGNALS=1).
@@ -277,6 +288,7 @@ cat <<ENTRY
       - RELAY_LANE_COOLDOWN_S=${RELAY_LANE_COOLDOWN_S:-240}
       - RELAY_LANE_429_S=${RELAY_LANE_429_S:-120}
       - RELAY_LANE_STICKY_MAX=${RELAY_LANE_STICKY_MAX:-10000}
+      - RELAY_LANE_MODE=${LANE_MODE}
       - RELAY_LANE_RETRY_MAX=${RELAY_LANE_RETRY_MAX:-3}
       - RELAY_LANE_RETRY_MAX_BODY=${RELAY_LANE_RETRY_MAX_BODY:-1048576}
       - RELAY_DIRECT_PUBLIC=${RELAY_DIRECT_PUBLIC:-0}
@@ -311,6 +323,7 @@ cat <<ENTRY
       - RELAY_LANE_COOLDOWN_S=${RELAY_LANE_COOLDOWN_S:-240}
       - RELAY_LANE_429_S=${RELAY_LANE_429_S:-120}
       - RELAY_LANE_STICKY_MAX=${RELAY_LANE_STICKY_MAX:-10000}
+      - RELAY_LANE_MODE=${LANE_MODE}
       - RELAY_LANE_RETRY_MAX=${RELAY_LANE_RETRY_MAX:-3}
       - RELAY_LANE_RETRY_MAX_BODY=${RELAY_LANE_RETRY_MAX_BODY:-1048576}
       - RELAY_DIRECT_PUBLIC=${RELAY_DIRECT_PUBLIC:-0}

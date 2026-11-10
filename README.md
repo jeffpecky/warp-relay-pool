@@ -46,6 +46,7 @@ Or run non-interactively with auto-detected sizing recommendations:
 4. **Ingress Wiring:** Exposes the router on a public HTTPS URL (`--with-tunnels`, no Cloudflare account or open inbound port needed) or on your Tailscale address.
 5. **Keep-Cold Timers:** Installs `warp-keep-cold.timer` — a liveness sweep every 5 minutes (≤ 10 relays) or 15 minutes (> 10) that catches dead containers and silently throttled egresses. Rate-limit verdicts come from the client, not a probe: `warp-keep-cold-signals.service` consumes a client-reported 429 the moment it lands and restarts that `warp-N` onto a fresh `/64` until it streams again. Pool is "safe" once at least half the relays are alive — a lane answering 429 is serving. No time cap on rotation — just attempt-bounded.
 6. **One URL:** Prints the single relay URL to dial, plus a `curl` health check.
+7. **Lane Rotation Mode:** Asks once whether the pool is `sticky` (default — one account keeps one egress, needed for reasoning models) or `round-robin` (spread every request), and persists the choice to `.env` as `RELAY_LANE_MODE`.
 
 ---
 

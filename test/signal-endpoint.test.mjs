@@ -19,6 +19,9 @@ const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 const BASE_PORT = 27000 + Math.floor(Math.random() * 900);
 const TOKEN = "signal-token-for-tests";
 const PASS = "s3cret";
+// Every identity these tests connect as must be a configured account: the
+// username is a credential now, not a free-form label.
+const ACCOUNTS = ["client", "c-alpha", "runner", "c-beta", "c-gamma", "c-delta"];
 
 // Two lanes, each a fake SOCKS5 listener, so "which lane served this tunnel" is
 // observable from the outside: the lane's own socket records the CONNECT.
@@ -125,7 +128,7 @@ function spawnRelay({ token = TOKEN } = {}) {
       RELAY_COUNT: "2",
       BASE_PORT: String(BASE_PORT),
       RELAY_ALLOWED_TARGETS: "https://opencode.ai",
-      RELAY_PROXY_AUTH: `client:${PASS}`,
+      RELAY_PROXY_AUTH: ACCOUNTS.map((u) => `${u}:${PASS}`).join(","),
       ...(token === null ? {} : { RELAY_SIGNAL_TOKEN: token }),
       LIVE_SIGNAL_FILE: signalFile,
       WARP_HOST_1: "127.0.0.1",
@@ -228,17 +231,24 @@ test("a client id binds one lane, and a 429 report moves it to another", async (
   assert.equal(records[0].retryAfter, 30);
 });
 
-test("any username is an identity: a plain user gets the same lane affinity and reporting", async () => {
-  // The token is the capability. `runner` — the wizard default — must hold a
-  // lane and be able to condemn it exactly like a `c-`-prefixed name.
+test("a configured account holds a lane and can condemn it", async () => {
+  // `runner` — the wizard default — is an account in RELAY_PROXY_AUTH, so it
+  // authenticates, holds a lane, and reports exactly like any other account.
   const first = await connectAs("runner");
-  assert.ok(first >= 0, "a plain username with the right password must get a lane");
+  assert.ok(first >= 0, "a configured account must get a lane");
   assert.equal(await connectAs("runner"), first, "it holds its lane across tunnels");
 
   const res = await postSignal({ clientId: "runner", status: 429 });
   assert.equal(res.status, 204, "its 429 report must be accepted");
   const next = await connectAs("runner");
   assert.notEqual(next, first, "a reported 429 must rotate it");
+});
+
+test("an unconfigured username is a credential failure, not an identity", async () => {
+  // The username is a credential: holding the password is not enough to mint a
+  // new name, or one caller could squat every lane.
+  const served = await connectAs("invented-user");
+  assert.equal(served, null, "a username that is not a configured account must be refused");
 });
 
 test("a lane pin is not an identity", async () => {

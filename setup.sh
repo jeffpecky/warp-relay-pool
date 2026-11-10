@@ -518,7 +518,38 @@ else
 fi
 
 # -------------------------------------------------------------
-# 3b. Client 429-report token
+# 3b. Lane rotation mode
+# -------------------------------------------------------------
+# `sticky` keeps one account on one egress, which reasoning models need: they
+# return encrypted reasoning only the issuing egress can decrypt. `round-robin`
+# spreads every request across the pool. Chosen here, baked into the generated
+# compose by generate-compose.sh — regenerate after changing it.
+LANE_MODE="${RELAY_LANE_MODE:-sticky}"
+if [ "$AUTO_YES" != true ]; then
+  echo ""
+  echo "--- Lane Rotation ---"
+  echo "  1) Sticky      (Recommended: one account keeps one egress; needed for reasoning models)"
+  echo "  2) Round-robin (spread every request across the pool)"
+  printf "Choose rotation [1/2, default: 1]: "
+  read -r user_mode || true
+  case "$user_mode" in
+    2|round-robin|roundrobin) LANE_MODE="round-robin" ;;
+  esac
+fi
+case "$LANE_MODE" in
+  sticky|round-robin) ;;
+  *)
+    log_warn "RELAY_LANE_MODE='${LANE_MODE}' is not sticky|round-robin; using sticky."
+    LANE_MODE="sticky"
+    ;;
+esac
+RELAY_LANE_MODE="$LANE_MODE"
+export RELAY_LANE_MODE
+set_env_value RELAY_LANE_MODE "$RELAY_LANE_MODE"
+log_info "Lane rotation: ${RELAY_LANE_MODE}."
+
+# -------------------------------------------------------------
+# 3c. Client 429-report token
 # -------------------------------------------------------------
 # The relay cannot read a status inside a CONNECT tunnel, so the client that
 # terminates TLS (zen-proxy) reports the 429 over POST /__signal. That path is
@@ -834,14 +865,17 @@ echo ""
 if [ -n "${RELAY_SIGNAL_TOKEN:-}" ]; then
   echo "Client 429 reporting (zen-proxy) — copy these two values into it:"
   echo "  RELAY_SIGNAL_TOKEN=${RELAY_SIGNAL_TOKEN}"
-  echo "  PROXY_URL=http://<any-user>:<proxy-password>@<relay-host>:<port>"
+  echo "  PROXY_URL=http://<proxy-user>:<proxy-password>@<relay-host>:<port>"
   echo ""
-  echo "  Any username works, including the default '${RELAY_PROXY_AUTH%%:*}': it"
-  echo "  names this client, and that is how a report maps back to the lane it was"
-  echo "  served. The password half is the proxy password from RELAY_PROXY_AUTH."
+  echo "  Both halves are credentials: the username AND the password must match an"
+  echo "  account in RELAY_PROXY_AUTH. An invented username is a 407, exactly like a"
+  echo "  wrong password — the username is also the client identity a 429 report"
+  echo "  maps back to the lane it was served, so it cannot be open by design."
   echo "  zen-proxy reads the username from PROXY_URL, so there is no separate"
   echo "  client-id setting. The only reserved username is lane-<n>, which the"
   echo "  keep-cold prober uses to pin a lane — it is not a client identity."
+  echo "  To add another client, append ',user:pass' to RELAY_PROXY_AUTH in .env,"
+  echo "  re-run ./generate-compose.sh ${COUNT} && docker compose up -d."
   echo "  The token is in ./.env (root-only) — treat it like the proxy password."
   echo ""
 else

@@ -97,6 +97,13 @@ test("wrong proxy credentials → 407", async () => {
   assert.equal(res.status, 407);
 });
 
+test("right password with an unconfigured username → 407", async () => {
+  // Both halves are credentials. Accepting any username would let one caller
+  // mint unlimited identities and claim every sticky lane.
+  const res = await get({ "proxy-authorization": `Basic ${Buffer.from("invented:opardmpl").toString("base64")}` });
+  assert.equal(res.status, 407);
+});
+
 test("valid x-relay-auth token alone is NOT enough in this mode (exact origins gated too)", async () => {
   const res = await get({ "x-relay-auth": CRED });
   assert.equal(res.status, 407);

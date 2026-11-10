@@ -22,6 +22,31 @@ test("sticky key holds its lane with no TTL", () => {
   assert.equal(p.pick("ses_a").n, first.n, "still held on a later call");
 });
 
+test("round-robin mode spreads one key across the pool", () => {
+  const p = pool(3, { mode: "round-robin" });
+  const got = [p.pick("ses_r"), p.pick("ses_r"), p.pick("ses_r"), p.pick("ses_r")].map((l) => l.n);
+  assert.deepEqual(got, [1, 2, 3, 1], "one client must not pin a lane in round-robin");
+});
+
+test("round-robin mode still records the lane a key was last served by", () => {
+  // A 429 report resolves through heldFor(), so the binding must survive even
+  // when pick() ignores it.
+  const p = pool(3, { mode: "round-robin" });
+  const served = p.pick("c:client");
+  assert.equal(p.heldFor("c:client")?.n, served.n);
+});
+
+test("sticky mode is the default", () => {
+  const p = pool(3);
+  const first = p.pick("same");
+  assert.equal(p.pick("same").n, first.n);
+  assert.equal(p.heldFor("same")?.n, first.n);
+});
+
+test("construction rejects an unknown rotation mode", () => {
+  assert.throws(() => pool(1, { mode: "random" }), /mode must be sticky\|round-robin/);
+});
+
 test("a cooled lane is skipped and the sticky key re-picks", () => {
   const p = pool(2);
   const held = p.pick("ses_b");
@@ -278,6 +303,15 @@ test("lane-N userinfo pins only with configured credentials", () => {
     "a missing password is not a matching password",
   );
   assert.equal(resolvePinnedLane({ ...base, proxyAuth: "u:p", proxyUser: "lane-9", proxyPass: "p" }), null);
+});
+
+test("a lane-N pin authenticates with the FIRST account's password only", () => {
+  // The probe has no username of its own, so it borrows the first account's
+  // password. A later account's password must not open a pin.
+  const lanes = pool(3).lanes;
+  const base = { headers: { "x-keep-cold-probe": "1" }, proxyUser: "lane-2", lanes, proxyAuth: "a:pa,b:pb" };
+  assert.equal(resolvePinnedLane({ ...base, proxyPass: "pa" })?.n, 2);
+  assert.equal(resolvePinnedLane({ ...base, proxyPass: "pb" }), null);
 });
 
 test("a lane id is matched in range, never as a prefix or a fraction", () => {
