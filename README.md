@@ -29,7 +29,7 @@ a lane is throttled or dead, and retries a `429` internally. Detail:
 Deploy on any Linux VPS with systemd (Ubuntu, Debian, Fedora, CentOS):
 
 ```bash
-git clone https://github.com/trefeon/warp-relay-pool.git
+git clone https://github.com/jeffpecky/warp-relay-pool.git
 cd warp-relay-pool
 ./setup.sh
 ```

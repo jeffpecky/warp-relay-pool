@@ -109,7 +109,7 @@ Supporting measures already in the tree:
 
 Use GitHub private vulnerability reporting: **Security tab → Report a
 vulnerability**
-(https://github.com/trefeon/warp-relay-pool/security/advisories/new).
+(https://github.com/jeffpecky/warp-relay-pool/security/advisories/new).
 Do not open a public issue for allowlist bypass, secret exposure, or
 anything exploitable. Include the affected file/commit, a reproduction,
 and the impact. Only the latest `main` is supported.
