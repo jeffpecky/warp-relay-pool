@@ -10,7 +10,8 @@ the security model, the repository privacy rules, and how to report issues.
 **Allowlist gate (`server.mjs`).** Every relayed request must carry an
 `x-relay-target` header that matches an entry of
 `RELAY_ALLOWED_TARGETS` (default: `https://opencode.ai`,
-`https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net`).
+`https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net`,
+`https://cloudflare.com`).
 Exact-origin entries match that origin only; `*` matches any `http`/`https`
 origin, `*.suffix` matches the apex plus subdomains, and `re:<regex>` is an
 anchored JS regex on the origin. Anything else gets `403 Forbidden`. The upstream

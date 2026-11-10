@@ -20,7 +20,7 @@ const HEADER_PATH = "x-relay-path";
 // signals, or a probe's own 429 would be replayed to the next pass.
 const HEADER_PROBE = "x-keep-cold-probe";
 const HEADER_AUTH = "x-relay-auth";
-const DEFAULT_ALLOWED_TARGETS = "https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net";
+const DEFAULT_ALLOWED_TARGETS = "https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net,https://cloudflare.com";
 const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TARGETS)
   .split(",")
   .map((s) => s.trim().replace(/\/$/, ""))
