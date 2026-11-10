@@ -281,7 +281,7 @@ cat <<ENTRY
       - RELAY_LANE_RETRY_MAX_BODY=${RELAY_LANE_RETRY_MAX_BODY:-1048576}
       - RELAY_DIRECT_PUBLIC=${RELAY_DIRECT_PUBLIC:-0}
       - RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH_BAKED:-}
-      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
+      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net,https://cloudflare.com}
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
@@ -315,7 +315,7 @@ cat <<ENTRY
       - RELAY_LANE_RETRY_MAX_BODY=${RELAY_LANE_RETRY_MAX_BODY:-1048576}
       - RELAY_DIRECT_PUBLIC=${RELAY_DIRECT_PUBLIC:-0}
       - RELAY_PROXY_AUTH=${RELAY_PROXY_AUTH_BAKED:-}
-      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
+      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net,https://cloudflare.com}
       - RELAY_AUTH_TOKEN=${RELAY_AUTH_TOKEN:-}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}

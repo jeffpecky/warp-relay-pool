@@ -17,7 +17,8 @@ carries no `depends_on: - relay`.
 
 **403 `Forbidden target`.** `x-relay-target` is not in the allowlist
 (`RELAY_ALLOWED_TARGETS`, default `https://opencode.ai`,
-`https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net`). Fix the header (a trailing `/` is stripped for you)
+`https://api.kilo.ai`, `https://oai.endpoints.kepler.ai.cloud.ovh.net`,
+`https://cloudflare.com`). Fix the header (a trailing `/` is stripped for you)
 or set the env and re-run
 `./generate-compose.sh <count> [--with-tunnels] && docker compose up -d`
 (the generator bakes the allowlist into the relay service environment;

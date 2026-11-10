@@ -93,7 +93,8 @@ failure semantics a client can observe live in
 Full model and reporting in [SECURITY.md](SECURITY.md):
 - **Closed default (403):** the relay router (`server.mjs`) enforces
   `RELAY_ALLOWED_TARGETS` (`https://opencode.ai`, `https://api.kilo.ai`,
-  `https://oai.endpoints.kepler.ai.cloud.ovh.net`). Any other origin
+  `https://oai.endpoints.kepler.ai.cloud.ovh.net`, `https://cloudflare.com`).
+  Any other origin
   returns **HTTP 403 Forbidden**; upstream `3xx` redirects are refused
   (`502`), so an allowlisted origin cannot steer the relay elsewhere.
 - **Wildcard-requires-token boundary (401):** wildcard/suffix/regex entries
