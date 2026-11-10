@@ -548,6 +548,17 @@ export RELAY_LANE_MODE
 set_env_value RELAY_LANE_MODE "$RELAY_LANE_MODE"
 log_info "Lane rotation: ${RELAY_LANE_MODE}."
 
+# The allowlist is the only thing keeping a public relay from being an open
+# proxy, and generate-compose.sh bakes it into the compose file. Persist it
+# only when it is actually set: an install that never extends it keeps the
+# code default, so a later default (cloudflare.com, for the documented health
+# check) still reaches an existing box on regeneration instead of freezing
+# whatever the default was at install time.
+if [ -n "${RELAY_ALLOWED_TARGETS:-}" ]; then
+  set_env_value RELAY_ALLOWED_TARGETS "$RELAY_ALLOWED_TARGETS"
+  log_info "Allowed targets: ${RELAY_ALLOWED_TARGETS}."
+fi
+
 # -------------------------------------------------------------
 # 3c. Client 429-report token
 # -------------------------------------------------------------
