@@ -418,6 +418,11 @@ if (rawProbeEnv !== undefined) {
   console.error("keep-cold: PROBE_MODELS is empty — nothing to probe");
   process.exit(2);
  }
+} else if (SIGNALS || WATCH_SIGNALS) {
+ // A signals pass never probes, so it never needs the model list. Discovery is
+ // a network round trip; the watcher spawns this process on every report, so
+ // asking OpenCode here would put a fetch behind every 429.
+ PROBE_MODELS = [];
 } else {
  if (PROBE_TARGET.includes("opencode.ai")) {
   PROBE_MODELS = await discoverOpenCodeFreeModels(PROBE_TARGET);
@@ -2458,6 +2463,17 @@ async function watchSignals() {
  let running = null;
  let queued = false;
  let timer = null;
+ // File identity the poll last saw, so an idle tick is a no-op. Seeded with the
+ // state at startup: an empty file is not a report.
+ const pollSig = () => {
+  try {
+   const st = fs.statSync(LIVE_SIGNAL_FILE);
+   return `${st.mtimeMs}:${st.size}`;
+  } catch {
+   return "missing";
+  }
+ };
+ let lastPollSig = pollSig();
 
  // One worker at a time: the file is consumed destructively, so two passes
  // racing would split the reports between them.
@@ -2519,7 +2535,14 @@ async function watchSignals() {
   // A missing directory or an unsupported platform: the poll below still works.
   log(`signal watch: cannot watch ${dir} (${shortReason(err)}) — polling only`);
  }
- const poll = setInterval(() => schedule("poll"), POLL_MS);
+ const poll = setInterval(() => {
+  // The poll exists to catch a rename `fs.watch` missed, not to run a pass on
+  // every tick: an idle watcher must not spawn a worker every POLL_MS.
+  const sig = pollSig();
+  if (sig === lastPollSig) return;
+  lastPollSig = sig;
+  schedule("poll");
+ }, POLL_MS);
  poll.unref?.();
 
  // Ctrl-C / SIGTERM must not leave a restart half-done: nothing is awaited past

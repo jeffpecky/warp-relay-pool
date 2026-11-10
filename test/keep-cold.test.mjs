@@ -18,10 +18,12 @@ import { spawn } from "node:child_process";
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 
 // Node --test runs test files in parallel: relay-guard.test.mjs owns
-// 23000-23999, this file owns 25000-26999 and never reuses a block. The start
+// 23000-24099, this file owns 24100-26999 and never reuses a block. The start
 // is fixed rather than random: the band is this file's alone, and a random
 // start only ever bought a run that occasionally reserved too little of it.
-const PORT_MIN = 25000;
+// A block per scenario means the band has to grow with the test count — 62
+// blocks ran out at 68 tests.
+const PORT_MIN = 24100;
 const PORT_MAX = 26999;
 const PORT_BLOCK = 32;
 let nextBlock = PORT_MIN;
@@ -1548,6 +1550,51 @@ test("--watch-signals leaves a lane alone when its report is quota-capped", asyn
     writeSignalsAtomically(sc, [{ ts: Date.now(), relay: 1, model: "model-a", status: 429, retryAfter: null }]);
     await waitFor(() => /pool is (cold|not cold)/.test(w.output()), 8_000, w.output);
     assert.deepEqual(restartLines(sc), []);
+  } finally {
+    await w.stop();
+  }
+});
+
+test("--watch-signals does not spawn a worker on every poll tick", async () => {
+  // The poll is the portable fallback for a rename fs.watch missed, not a
+  // heartbeat. An idle watcher that ran a pass every WATCH_POLL_MS spawned a
+  // process (and, before PROBE_MODELS was skipped for signals, a model-catalog
+  // fetch) every two seconds against an empty file. The marker is the worker's
+  // own "signals watch:" line, which only a spawn produces.
+  const sc = newScenario({ count: 2 });
+  await startRelays(sc);
+  writeStateFile(sc, {
+    1: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+    2: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+  });
+  fs.writeFileSync(sc.signalFile, JSON.stringify({ signals: [] }));
+  const w = startWatch(sc, { WATCH_POLL_MS: "250" });
+  try {
+    await waitFor(() => w.output().includes("signal watch:"), 10_000, w.output);
+    await new Promise((r) => setTimeout(r, 1_500));
+    const spawned = w.output().match(/signals watch: (poll|file change)/g) ?? [];
+    assert.deepEqual(spawned, [], `an idle watcher spawned ${spawned.length} worker(s): ${w.output()}`);
+  } finally {
+    await w.stop();
+  }
+});
+
+test("--watch-signals still catches a write the watch missed, via the poll", async () => {
+  // The fix above must not disable the fallback: a write must still be acted on
+  // when fs.watch never fires.
+  const sc = newScenario({ count: 2 });
+  await startRelays(sc);
+  writeStateFile(sc, {
+    1: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+    2: entry({ lastProbe: Date.now(), lastClean: Date.now() }),
+  });
+  fs.writeFileSync(sc.signalFile, JSON.stringify({ signals: [] }));
+  const w = startWatch(sc, { WATCH_POLL_MS: "250", ROTATE_SPACING_MS: "0" });
+  try {
+    await waitFor(() => w.output().includes("signal watch:"), 10_000, w.output);
+    writeSignalsAtomically(sc, [{ ts: Date.now(), relay: 2, model: "model-a", status: 429, retryAfter: null }]);
+    await waitFor(() => restartLines(sc).length >= 1, 8_000, w.output);
+    assert.deepEqual(restartLines(sc), ["restart warp-relay-warp-2"]);
   } finally {
     await w.stop();
   }
