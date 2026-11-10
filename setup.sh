@@ -815,7 +815,7 @@ sh ./get-status.sh "$COUNT"
 
 echo ""
 echo "======================================================================="
-printf "%s\n" "${GREEN}${BOLD}SETUP COMPLETE${RESET}"
+printf "${GREEN}${BOLD}%s${RESET}\n" "SETUP COMPLETE"
 echo "======================================================================="
 echo "Dial the single relay URL printed above. It fronts all ${COUNT} relays:"
 echo "every request is routed to a lane, and a throttled or dead lane is"
